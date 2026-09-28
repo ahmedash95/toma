@@ -1,11 +1,13 @@
 mod approval;
 mod claude;
 mod codex;
+mod cursor;
 mod process;
 
 pub use approval::run_approval_bridge;
 pub use claude::ClaudeCodeRunner;
 pub use codex::CodexCliRunner;
+pub use cursor::CursorCliRunner;
 pub use process::find_executable;
 
 use serde::{Deserialize, Serialize};
