@@ -58,7 +58,12 @@ jobs:
           fi
 
       - name: Install Xcode Metal Toolchain
-        run: xcodebuild -downloadComponent MetalToolchain
+        run: |
+          if xcodebuild -help 2>&1 | grep -q downloadComponent; then
+            xcodebuild -downloadComponent MetalToolchain
+          else
+            echo "Skipping Metal toolchain download (bundled with this Xcode on CI)"
+          fi
 
       - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
         run: |
