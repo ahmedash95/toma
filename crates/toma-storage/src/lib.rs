@@ -66,6 +66,11 @@ pub trait TomaStore: Send + Sync {
         at: TimestampMs,
     ) -> StorageResult<()>;
     fn save_worktree(&self, worktree: &WorktreeRecord) -> StorageResult<()>;
+    fn set_provider_session_id(
+        &self,
+        session_id: SessionId,
+        provider_session_id: &str,
+    ) -> StorageResult<()>;
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -186,12 +191,17 @@ impl SqliteStore {
         let work_id: ChannelId = parse_id("018f0000-0000-7000-8000-000000000003")?;
         let codex_id: AgentId = parse_id("018f0000-0000-7000-8000-000000000004")?;
         let claude_id: AgentId = parse_id("018f0000-0000-7000-8000-000000000005")?;
+        let person_id: PersonId = parse_id("018f0000-0000-7000-8000-000000000006")?;
         let repository_path = repository_path.into();
         let mut connection = self.connection()?;
         let tx = connection.transaction()?;
         tx.execute(
             "INSERT INTO workspaces (id, name, repository_path, created_at) VALUES (?1, 'Toma', ?2, 0) ON CONFLICT(id) DO NOTHING",
             params![workspace_id.to_string(), to_json!(&repository_path)?],
+        )?;
+        tx.execute(
+            "INSERT INTO people (id, workspace_id, display_name) VALUES (?1, ?2, 'You') ON CONFLICT(id) DO NOTHING",
+            params![person_id.to_string(), workspace_id.to_string()],
         )?;
         for (id, name, position) in [(general_id, "general", 0), (work_id, "work", 1)] {
             tx.execute(
@@ -426,6 +436,18 @@ impl TomaStore for SqliteStore {
         connection.execute(
             "INSERT INTO raw_history (run_id, sequence, payload, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![run_id.to_string(), sequence, payload, at],
+        )?;
+        Ok(())
+    }
+
+    fn set_provider_session_id(
+        &self,
+        session_id: SessionId,
+        provider_session_id: &str,
+    ) -> StorageResult<()> {
+        self.connection()?.execute(
+            "UPDATE sessions SET provider_session_id = ?2 WHERE id = ?1",
+            params![session_id.to_string(), provider_session_id],
         )?;
         Ok(())
     }

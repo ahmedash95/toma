@@ -1,5 +1,5 @@
 use crate::process::{CommandSpec, ProcessRunner};
-use crate::{AgentRunner, RunRequest, RunnerCapabilities, RunnerError, RunnerEvent};
+use crate::{AgentRunner, RunRequest, RunnerCapabilities, RunnerError, RunnerEvent, translate};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use toma_domain::{RunId, RunnerProvider};
@@ -40,6 +40,19 @@ impl CodexCliRunner {
     }
 }
 
+/// Maps an `exec --json` line to the events it implies.
+fn codex_event(line: &serde_json::Value) -> Option<RunnerEvent> {
+    match line["type"].as_str()? {
+        "thread.started" => Some(RunnerEvent::Started {
+            provider_session_id: line["thread_id"].as_str().map(str::to_owned),
+        }),
+        "item.completed" if line["item"]["type"] == "agent_message" => Some(RunnerEvent::Reply(
+            line["item"]["text"].as_str()?.to_owned(),
+        )),
+        _ => None,
+    }
+}
+
 impl Default for CodexCliRunner {
     fn default() -> Self {
         Self::new()
@@ -70,7 +83,9 @@ impl AgentRunner for CodexCliRunner {
         emit: &mut dyn FnMut(RunnerEvent),
     ) -> Result<(), RunnerError> {
         let command = Self::command(&request);
-        self.process.run(request, command, emit)
+        self.process.run(request, command, &mut |event| {
+            translate(event, emit, codex_event)
+        })
     }
 
     fn cancel(&self, run_id: RunId) -> Result<(), RunnerError> {

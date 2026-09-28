@@ -34,8 +34,12 @@ pub struct RunRequest<'a> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RunnerEvent {
-    Started { provider_session_id: Option<String> },
+    Started {
+        provider_session_id: Option<String>,
+    },
     Output(String),
+    /// The agent's user-facing answer, extracted from the provider's raw output.
+    Reply(String),
     WaitingForInput(String),
     Completed,
     Failed(String),
@@ -62,4 +66,20 @@ pub trait AgentRunner: Send + Sync {
         emit: &mut dyn FnMut(RunnerEvent),
     ) -> Result<(), RunnerError>;
     fn cancel(&self, run_id: RunId) -> Result<(), RunnerError>;
+}
+
+/// Forwards `event`, followed by whatever `parse` derives from it when it is a JSON output line.
+pub(crate) fn translate(
+    event: RunnerEvent,
+    emit: &mut dyn FnMut(RunnerEvent),
+    parse: fn(&serde_json::Value) -> Option<RunnerEvent>,
+) {
+    let derived = match &event {
+        RunnerEvent::Output(line) => serde_json::from_str(line).ok().and_then(|v| parse(&v)),
+        _ => None,
+    };
+    emit(event);
+    if let Some(derived) = derived {
+        emit(derived);
+    }
 }

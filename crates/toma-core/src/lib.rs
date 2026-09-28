@@ -502,13 +502,19 @@ impl TomaCore {
                 provider_session_id,
             } => {
                 if let Some(provider_session_id) = provider_session_id {
-                    self.set_provider_session_id(run_id, provider_session_id)?;
+                    let session_id = self.set_provider_session_id(run_id, &provider_session_id)?;
+                    self.store
+                        .set_provider_session_id(session_id, &provider_session_id)?;
                 }
                 self.transition_run(run_id, WorkStatus::Working, events)?;
             }
             RunnerEvent::Output(text) => {
                 self.ensure_run_started(run_id, events)?;
                 events.push(AppEvent::RunnerOutput { run_id, text });
+            }
+            RunnerEvent::Reply(body) => {
+                let message_id = self.post_agent_reply(run_id, body, now)?;
+                events.push(AppEvent::MessagePosted { message_id });
             }
             RunnerEvent::WaitingForInput(text) => {
                 self.ensure_run_started(run_id, events)?;
@@ -808,11 +814,48 @@ impl TomaCore {
         Err(CoreError::InvalidCommand("unknown or unloaded run".into()))
     }
 
+    /// Posts the agent's answer into the task thread the run belongs to.
+    fn post_agent_reply(
+        &self,
+        run_id: RunId,
+        body: String,
+        now: TimestampMs,
+    ) -> Result<MessageId, CoreError> {
+        let mut state = self.state()?;
+        for snapshot in state.snapshots.values_mut() {
+            let Some(session) = snapshot
+                .runs
+                .iter()
+                .find(|run| run.id == run_id)
+                .and_then(|run| snapshot.sessions.iter().find(|s| s.id == run.session_id))
+            else {
+                continue;
+            };
+            let thread = snapshot
+                .threads
+                .iter()
+                .find(|thread| thread.id == session.thread_id)
+                .ok_or_else(|| CoreError::InvalidCommand("session has no thread".into()))?;
+            let message = Message {
+                id: MessageId::new(),
+                channel_id: thread.channel_id,
+                thread_id: Some(thread.id),
+                author: MessageAuthor::Agent(session.agent_id),
+                body,
+                created_at: now,
+            };
+            self.store.insert_message(&message, &[])?;
+            snapshot.messages.push(message.clone());
+            return Ok(message.id);
+        }
+        Err(CoreError::InvalidCommand("unknown or unloaded run".into()))
+    }
+
     fn set_provider_session_id(
         &self,
         run_id: RunId,
-        provider_session_id: String,
-    ) -> Result<(), CoreError> {
+        provider_session_id: &str,
+    ) -> Result<SessionId, CoreError> {
         let mut state = self.state()?;
         for snapshot in state.snapshots.values_mut() {
             let Some(session_id) = snapshot
@@ -828,8 +871,8 @@ impl TomaCore {
                 .iter_mut()
                 .find(|session| session.id == session_id)
             {
-                session.provider_session_id = Some(provider_session_id);
-                return Ok(());
+                session.provider_session_id = Some(provider_session_id.to_owned());
+                return Ok(session_id);
             }
         }
         Err(CoreError::InvalidCommand("unknown or unloaded run".into()))
@@ -875,6 +918,7 @@ fn raw_payload(event: &RunnerEvent) -> String {
             provider_session_id,
         } => format!("started:{}", provider_session_id.as_deref().unwrap_or("")),
         RunnerEvent::Output(text) => text.clone(),
+        RunnerEvent::Reply(text) => format!("reply:{text}"),
         RunnerEvent::WaitingForInput(text) => format!("waiting_for_input:{text}"),
         RunnerEvent::Completed => "completed".into(),
         RunnerEvent::Failed(message) => format!("failed:{message}"),

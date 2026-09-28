@@ -205,3 +205,34 @@ fn cancellation_targets_the_requested_active_run_and_cleans_it_up() {
     ));
     assert!(runner.cancel(run_id).is_err());
 }
+
+#[test]
+fn provider_json_yields_session_ids_and_replies() {
+    type Build = fn(PathBuf) -> Arc<dyn AgentRunner>;
+    let cases: [(&str, Build); 2] = [
+        (
+            r#"{"type":"system","subtype":"init","session_id":"s-1"}
+{"type":"result","result":"hi"}"#,
+            |path| Arc::new(ClaudeCodeRunner::with_executable(path)),
+        ),
+        (
+            r#"{"type":"thread.started","thread_id":"s-1"}
+{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}"#,
+            |path| Arc::new(CodexCliRunner::with_executable(path)),
+        ),
+    ];
+    for (output, runner) in cases {
+        let directory = TestDirectory::new();
+        let executable = fake_executable(&directory, &format!("cat <<'EOF'\n{output}\nEOF"));
+        let mut events = Vec::new();
+        runner(executable)
+            .run(request(RunId::new(), directory.path()), &mut |event| {
+                events.push(event)
+            })
+            .unwrap();
+        assert!(events.contains(&RunnerEvent::Started {
+            provider_session_id: Some("s-1".into())
+        }));
+        assert!(events.contains(&RunnerEvent::Reply("hi".into())));
+    }
+}

@@ -95,6 +95,24 @@ impl TomaStore for FakeStore {
         Ok(())
     }
 
+    fn set_provider_session_id(
+        &self,
+        session_id: SessionId,
+        provider_session_id: &str,
+    ) -> StorageResult<()> {
+        if let Some(session) = self
+            .snapshot
+            .lock()
+            .unwrap()
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+        {
+            session.provider_session_id = Some(provider_session_id.to_owned());
+        }
+        Ok(())
+    }
+
     fn save_worktree(&self, worktree: &WorktreeRecord) -> StorageResult<()> {
         self.snapshot
             .lock()
@@ -575,4 +593,36 @@ fn recover_fails_runs_orphaned_by_a_previous_process() {
     };
     assert_eq!(status(runs[0].id), WorkStatus::Failed);
     assert_eq!(status(runs[1].id), WorkStatus::WaitingForInput);
+}
+
+#[test]
+fn agent_reply_becomes_a_thread_message_and_session_id_persists() {
+    let fixture = fixture_with_events(vec![
+        RunnerEvent::Started {
+            provider_session_id: Some("provider-1".into()),
+        },
+        RunnerEvent::Reply("done".into()),
+        RunnerEvent::Completed,
+    ]);
+    fixture
+        .core
+        .dispatch(AppCommand::PostMessage {
+            channel_id: fixture.channel_id,
+            thread_id: None,
+            body: "Build it".into(),
+            attachments: vec![AttachmentTarget::Agent {
+                agent_id: fixture.agent_id,
+            }],
+        })
+        .unwrap();
+
+    let snapshot = fixture.store.snapshot.lock().unwrap();
+    let reply = snapshot.messages.last().unwrap();
+    assert_eq!(reply.body, "done");
+    assert_eq!(reply.author, MessageAuthor::Agent(fixture.agent_id));
+    assert_eq!(reply.thread_id, Some(snapshot.threads[0].id));
+    assert_eq!(
+        snapshot.sessions[0].provider_session_id.as_deref(),
+        Some("provider-1")
+    );
 }
