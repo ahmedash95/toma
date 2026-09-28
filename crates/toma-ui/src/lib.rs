@@ -4,7 +4,7 @@ mod shell;
 mod theme;
 mod view_model;
 
-pub use composer::{ComposerModel, MentionCandidate};
+pub use composer::{ComposerModel, MentionCandidate, bind_keys};
 pub use markdown::render_markdown;
 pub use theme::Theme;
 pub use view_model::{ContextKey, ShellViewModel};
@@ -32,6 +32,7 @@ pub fn run_with_snapshot(snapshot: WorkspaceSnapshot) {
 fn open(snapshot: WorkspaceSnapshot, backend: Option<(Arc<TomaCore>, WorkspaceId)>) {
     Application::new().run(move |cx: &mut App| {
         cx.set_global(Theme::for_appearance(cx.window_appearance()));
+        bind_keys(cx);
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
         cx.open_window(
             WindowOptions {
