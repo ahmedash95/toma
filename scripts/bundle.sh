@@ -29,6 +29,7 @@ fi
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$TARGET_DIR/release/toma" "$APP/Contents/MacOS/$EXECUTABLE"
+cp assets/Toma.icns "$APP/Contents/Resources/Toma.icns"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -41,6 +42,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <string>Toma</string>
   <key>CFBundleExecutable</key>
   <string>${EXECUTABLE}</string>
+  <key>CFBundleIconFile</key>
+  <string>Toma</string>
   <key>CFBundleIdentifier</key>
   <string>${BUNDLE_ID}</string>
   <key>CFBundleInfoDictionaryVersion</key>
