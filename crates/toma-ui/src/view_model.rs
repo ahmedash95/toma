@@ -9,6 +9,14 @@ pub struct ContextKey {
     pub thread_id: Option<ThreadId>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ThreadStats {
+    pub runs: usize,
+    pub tokens: i64,
+    pub cost_micros: Option<i64>,
+    pub duration_ms: i64,
+}
+
 pub struct ShellViewModel {
     pub snapshot: WorkspaceSnapshot,
     selected_channel: Option<ChannelId>,
@@ -85,6 +93,63 @@ impl ShellViewModel {
         let mut threads: Vec<_> = self.snapshot.threads.iter().collect();
         threads.sort_by_key(|thread| std::cmp::Reverse(thread.updated_at));
         threads
+    }
+
+    /// Agents in a thread with the status of their latest run, in the order they joined.
+    pub fn thread_agents(&self, thread_id: ThreadId) -> Vec<(&AgentDefinition, WorkStatus)> {
+        self.snapshot
+            .sessions
+            .iter()
+            .filter(|session| session.thread_id == thread_id)
+            .filter_map(|session| {
+                let agent = self
+                    .snapshot
+                    .agents
+                    .iter()
+                    .find(|a| a.id == session.agent_id)?;
+                let status = self
+                    .snapshot
+                    .runs
+                    .iter()
+                    .filter(|run| run.session_id == session.id)
+                    .max_by_key(|run| run.sequence)
+                    .map_or(session.status, |run| run.status);
+                Some((agent, status))
+            })
+            .collect()
+    }
+
+    /// What all runs in a thread consumed. Time falls back to run timestamps when the
+    /// provider does not report a duration.
+    pub fn thread_stats(&self, thread_id: ThreadId) -> ThreadStats {
+        let mut stats = ThreadStats::default();
+        for session in self
+            .snapshot
+            .sessions
+            .iter()
+            .filter(|s| s.thread_id == thread_id)
+        {
+            for run in self
+                .snapshot
+                .runs
+                .iter()
+                .filter(|r| r.session_id == session.id)
+            {
+                stats.runs += 1;
+                let usage = self.snapshot.usages.iter().find(|u| u.run_id == run.id);
+                if let Some(usage) = usage {
+                    stats.tokens += usage.input_tokens + usage.output_tokens;
+                    if let Some(cost) = usage.cost_micros {
+                        *stats.cost_micros.get_or_insert(0) += cost;
+                    }
+                }
+                stats.duration_ms += usage
+                    .and_then(|u| u.duration_ms)
+                    .or_else(|| Some(run.finished_at? - run.started_at?))
+                    .unwrap_or(0);
+            }
+        }
+        stats
     }
 
     /// Names of agents with a run still in progress in `thread_id`.

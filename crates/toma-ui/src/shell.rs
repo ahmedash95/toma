@@ -1,20 +1,28 @@
 use gpui::{
-    Animation, AnimationExt, AnyElement, Context, Entity, Focusable, FontWeight, Hsla, IntoElement,
-    MouseButton, PathPromptOptions, Render, ScrollHandle, SharedString, Subscription, Window, div,
-    prelude::*, pulsating_between, px,
+    Animation, AnimationExt, AnyElement, App, Context, Entity, FocusHandle, Focusable, FontWeight,
+    Hsla, IntoElement, MouseButton, MouseMoveEvent, PathPromptOptions, Render, ScrollHandle,
+    SharedString, Subscription, Window, div, prelude::*, pulsating_between, px, rgb,
 };
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    rc::Rc,
+    sync::Arc,
+    time::Duration,
+};
 use toma_core::TomaCore;
 use toma_domain::*;
 use toma_storage::WorkspaceSnapshot;
 
 use crate::Theme;
 use crate::composer::{Composer, ComposerEvent, MentionCandidate};
+use crate::controls::{ButtonStyle, Cancel, OnPress, button, focus_navigation};
+use crate::icons::Icon;
 use crate::markdown::render_markdown;
-use crate::view_model::{ContextKey, ShellViewModel};
+use crate::view_model::{ContextKey, ShellViewModel, ThreadStats};
 
 /// Height of the unified title bar strip; the traffic lights sit inside it.
 const TITLEBAR: f32 = 52.;
+const THREAD_WIDTH: (f32, f32) = (300., 900.);
 
 pub struct TomaShell {
     model: ShellViewModel,
@@ -24,6 +32,14 @@ pub struct TomaShell {
     channel_scroll: ScrollHandle,
     thread_scroll: ScrollHandle,
     seen_messages: usize,
+    thread_width: f32,
+    resizing_thread: bool,
+    /// Focus to move to on the next frame, once the target element exists.
+    pending_focus: Option<FocusHandle>,
+    /// (Deny, Allow) buttons of each pending permission request.
+    request_buttons: HashMap<String, (FocusHandle, FocusHandle)>,
+    /// Requests that already took focus once, so they don't grab it again.
+    focused_requests: HashSet<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -32,7 +48,7 @@ impl TomaShell {
         snapshot: WorkspaceSnapshot,
         backend: Option<(Arc<TomaCore>, WorkspaceId)>,
         window: &mut Window,
-        cx: &mut gpui::App,
+        cx: &mut App,
     ) -> Entity<Self> {
         let model = ShellViewModel::new(snapshot);
         let mentions: Vec<_> = model
@@ -110,6 +126,11 @@ impl TomaShell {
                 thread_composer,
                 channel_scroll: ScrollHandle::new(),
                 thread_scroll: ScrollHandle::new(),
+                thread_width: 400.,
+                resizing_thread: false,
+                pending_focus: None,
+                request_buttons: HashMap::new(),
+                focused_requests: HashSet::new(),
                 _subscriptions: subscriptions,
             }
         })
@@ -165,9 +186,6 @@ impl TomaShell {
     }
 
     fn submit(&mut self, key: ContextKey, body: &str) {
-        let Some((core, _)) = self.backend.clone() else {
-            return;
-        };
         let attachments = self
             .model
             .snapshot
@@ -176,33 +194,34 @@ impl TomaShell {
             .filter(|agent| agent.enabled && body.contains(&format!("@{}", agent.name)))
             .map(|agent| AttachmentTarget::Agent { agent_id: agent.id })
             .collect();
-        let command = AppCommand::PostMessage {
+        self.dispatch_in_background(AppCommand::PostMessage {
             channel_id: key.channel_id,
             thread_id: key.thread_id,
             body: body.to_owned(),
             attachments,
+        });
+    }
+
+    /// Commands that may run an agent block until its CLI exits, so they run off the UI
+    /// thread; their progress arrives through the revision poll.
+    fn dispatch_in_background(&self, command: AppCommand) {
+        let Some((core, _)) = self.backend.clone() else {
+            return;
         };
-        // Agent runs block until the CLI exits; progress arrives through the revision poll.
         std::thread::spawn(move || {
             if let Err(error) = core.dispatch(command) {
-                eprintln!("toma: posting message failed: {error}");
+                eprintln!("toma: command failed: {error}");
             }
         });
     }
 
-    fn answer_permission(&self, request: &PermissionRequest, allow: bool) {
-        let Some((core, _)) = self.backend.clone() else {
-            return;
-        };
-        let command = AppCommand::AnswerPermission {
+    fn answer_permission(&mut self, request: &PermissionRequest, allow: bool, cx: &mut App) {
+        // The card is about to disappear; hand focus back to where the person replies.
+        self.pending_focus = Some(self.thread_composer.focus_handle(cx));
+        self.dispatch_in_background(AppCommand::AnswerPermission {
             run_id: request.run_id,
             request_id: request.id.clone(),
             allow,
-        };
-        std::thread::spawn(move || {
-            if let Err(error) = core.dispatch(command) {
-                eprintln!("toma: answering permission failed: {error}");
-            }
         });
     }
 
@@ -251,6 +270,7 @@ impl TomaShell {
         self.channel_composer
             .update(cx, |composer, cx| composer.set_text(draft, cx));
         self.channel_scroll.scroll_to_bottom();
+        self.pending_focus = Some(self.channel_composer.focus_handle(cx));
         cx.notify();
     }
 
@@ -270,12 +290,80 @@ impl TomaShell {
         self.thread_composer
             .update(cx, |composer, cx| composer.set_text(draft, cx));
         self.thread_scroll.scroll_to_bottom();
+        self.pending_focus = Some(self.thread_composer.focus_handle(cx));
         cx.notify();
     }
 
     fn close_thread(&mut self, cx: &mut Context<Self>) {
         self.model.close_thread();
+        self.pending_focus = Some(self.channel_composer.focus_handle(cx));
         cx.notify();
+    }
+
+    fn author_color(&self, author: MessageAuthor, theme: &Theme) -> Hsla {
+        match author {
+            MessageAuthor::Agent(id) => {
+                let provider = self
+                    .model
+                    .snapshot
+                    .agents
+                    .iter()
+                    .find(|agent| agent.id == id)
+                    .map(|agent| agent.provider);
+                match provider {
+                    Some(RunnerProvider::ClaudeCodeCli) => rgb(0xd97757).into(),
+                    Some(RunnerProvider::CodexCli) => rgb(0x10a37f).into(),
+                    Some(RunnerProvider::CursorCli) => rgb(0x5b5bd6).into(),
+                    None => theme.gray,
+                }
+            }
+            MessageAuthor::Person(_) => theme.accent,
+            MessageAuthor::System => theme.gray,
+        }
+    }
+
+    /// Gives each visible permission request its buttons, and focuses Allow the first time
+    /// the request is shown, unless the person is in the middle of typing a reply.
+    fn prepare_request_focus(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let live: HashSet<String> = self
+            .model
+            .snapshot
+            .permission_requests
+            .iter()
+            .map(|request| request.id.clone())
+            .collect();
+        self.request_buttons.retain(|id, _| live.contains(id));
+        self.focused_requests.retain(|id| live.contains(id));
+        let Some(thread_id) = self.model.open_thread_id() else {
+            return;
+        };
+        let visible: Vec<String> = self
+            .model
+            .snapshot
+            .permission_requests
+            .iter()
+            .filter(|request| request.thread_id == thread_id)
+            .map(|request| request.id.clone())
+            .collect();
+        let typing = self.thread_composer.focus_handle(cx).is_focused(window)
+            && self
+                .thread_key()
+                .is_some_and(|key| !self.model.draft_for(key).is_empty());
+        for id in visible {
+            let (_, allow) = self
+                .request_buttons
+                .entry(id.clone())
+                .or_insert_with(|| {
+                    (
+                        cx.focus_handle().tab_stop(true).tab_index(1),
+                        cx.focus_handle().tab_stop(true).tab_index(2),
+                    )
+                })
+                .clone();
+            if !typing && self.focused_requests.insert(id) {
+                self.pending_focus = Some(allow);
+            }
+        }
     }
 
     fn sidebar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -286,7 +374,18 @@ impl TomaShell {
             .model
             .recent_threads()
             .into_iter()
-            .map(|thread| (thread.id, thread.title.clone(), thread.status))
+            .map(|thread| {
+                let agents: Vec<_> = self
+                    .model
+                    .thread_agents(thread.id)
+                    .into_iter()
+                    .map(|(agent, status)| {
+                        let color = self.author_color(MessageAuthor::Agent(agent.id), theme);
+                        (agent.name.clone(), color, status)
+                    })
+                    .collect();
+                (thread.id, thread.title.clone(), thread.status, agents)
+            })
             .collect();
 
         div()
@@ -315,7 +414,6 @@ impl TomaShell {
                                 .items_center()
                                 .justify_center()
                                 .rounded(px(5.))
-                                .text_size(px(15.))
                                 .text_color(theme.text_secondary)
                                 .cursor_pointer()
                                 .hover(|button| button.bg(theme.hover))
@@ -324,25 +422,24 @@ impl TomaShell {
                                         .into()
                                 })
                                 .on_click(cx.listener(|this, _, _, cx| this.new_channel(cx)))
-                                .child("+"),
+                                .child(Icon::Plus.view().size(px(14.))),
                         ),
                     )
                     .children(channels.into_iter().enumerate().map(|(index, channel)| {
                         let id = channel.id;
                         let selected = selected_channel == Some(id) && open_thread.is_none();
+                        let icon = if channel.repository_path.is_some() {
+                            Icon::Folder
+                        } else {
+                            Icon::Hash
+                        };
                         sidebar_row(("channel", index), selected, theme)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.model.close_thread();
                                 this.select_channel(id, cx);
                             }))
-                            .child(div().w(px(16.)).text_color(theme.text_tertiary).child("#"))
+                            .child(icon.view().size(px(14.)).text_color(theme.text_secondary))
                             .child(div().flex_grow().truncate().child(channel.name))
-                            .children(channel.repository_path.map(|_| {
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(theme.text_tertiary)
-                                    .child("folder")
-                            }))
                     }))
                     .child(div().h(px(14.)))
                     .child(section_header("Threads", theme))
@@ -352,16 +449,51 @@ impl TomaShell {
                             .py_1()
                             .text_size(px(12.))
                             .text_color(theme.text_tertiary)
-                            .child("Mention an agent to start one")
+                            .child("💬 Mention an agent to start one")
                     }))
                     .children(threads.into_iter().enumerate().map(
-                        |(index, (id, title, status))| {
-                            sidebar_row(("thread", index), open_thread == Some(id), theme)
-                                .on_click(
-                                    cx.listener(move |this, _, _, cx| this.open_thread(id, cx)),
+                        |(index, (id, title, status, agents))| {
+                            let open = open_thread == Some(id);
+                            div()
+                                .child(
+                                    sidebar_row(("thread", index), open, theme)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.open_thread(id, cx)
+                                        }))
+                                        .child(status_dot(status, theme))
+                                        .child(div().flex_grow().truncate().child(title)),
                                 )
-                                .child(status_dot(status, theme))
-                                .child(div().flex_grow().truncate().child(title))
+                                // Every agent working in the thread nests under it.
+                                .children(agents.into_iter().enumerate().map(
+                                    |(agent_index, (name, color, status))| {
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "thread-{index}-agent-{agent_index}"
+                                            )))
+                                            .h(px(22.))
+                                            .ml(px(18.))
+                                            .px_2()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .border_l_1()
+                                            .border_color(theme.separator)
+                                            .text_size(px(12.))
+                                            .text_color(theme.text_secondary)
+                                            .cursor_pointer()
+                                            .hover(|row| row.bg(theme.hover))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.open_thread(id, cx)
+                                            }))
+                                            .child(mini_avatar(&name, color))
+                                            .child(div().flex_grow().truncate().child(name))
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.))
+                                                    .child(status_emoji(status)),
+                                            )
+                                    },
+                                ))
                         },
                     )),
             )
@@ -376,6 +508,9 @@ impl TomaShell {
             .collect();
         let empty = rows.is_empty();
         let name = channel.as_ref().map_or("".into(), |c| c.name.clone());
+        let is_folder = channel
+            .as_ref()
+            .is_some_and(|c| c.repository_path.is_some());
         let folder = channel
             .as_ref()
             .and_then(|c| c.repository_path.clone())
@@ -407,9 +542,21 @@ impl TomaShell {
                     .border_color(theme.separator)
                     .child(
                         div()
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(format!("# {name}")),
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                if is_folder { Icon::Folder } else { Icon::Hash }
+                                    .view()
+                                    .size(px(14.))
+                                    .text_color(theme.text_secondary),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(name.clone()),
+                            ),
                     )
                     .children(folder.clone().map(|folder| {
                         div()
@@ -434,7 +581,7 @@ impl TomaShell {
                                 div()
                                     .text_size(px(20.))
                                     .font_weight(FontWeight::BOLD)
-                                    .child(format!("#{name}")),
+                                    .child(format!("👋 Welcome to #{name}")),
                             )
                             .child(
                                 div()
@@ -443,7 +590,7 @@ impl TomaShell {
                                     .text_color(theme.text_secondary)
                                     .child(match &folder {
                                         Some(folder) => format!(
-                                            "Agents mentioned here work in {folder}. Try @Claude."
+                                            "Agents mentioned here work in {folder}. Try @Claude or @Cursor."
                                         ),
                                         None => "Mention an agent to start a task.".into(),
                                     }),
@@ -463,6 +610,7 @@ impl TomaShell {
 
     fn message_row(&self, message: Message, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let author = self.model.author_name(message.author).to_owned();
+        let color = self.author_color(message.author, theme);
         let thread = self
             .model
             .snapshot
@@ -480,6 +628,18 @@ impl TomaShell {
                 .filter(|message| message.thread_id == Some(id))
                 .count();
             let working = self.model.working_agents(id);
+            let agents: Vec<_> = self
+                .model
+                .thread_agents(id)
+                .into_iter()
+                .map(|(agent, _)| {
+                    (
+                        agent.name.clone(),
+                        self.author_color(MessageAuthor::Agent(agent.id), theme),
+                    )
+                })
+                .collect();
+            let stats = self.model.thread_stats(id);
             let needs_approval = self
                 .model
                 .snapshot
@@ -489,17 +649,23 @@ impl TomaShell {
             div()
                 .mt_1()
                 .flex()
+                .flex_wrap()
                 .items_center()
                 .gap_3()
                 .child(
                     div()
                         .id(SharedString::from(format!("replies-{id}")))
+                        .flex()
+                        .items_center()
+                        .gap_1()
                         .text_size(px(12.))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(theme.accent)
                         .cursor_pointer()
                         .hover(|link| link.underline())
                         .on_click(cx.listener(move |this, _, _, cx| this.open_thread(id, cx)))
+                        .children(agents.iter().map(|(name, color)| mini_avatar(name, *color)))
+                        .child(Icon::Replies.view().size(px(13.)))
                         .child(match replies {
                             0 => "Open thread".to_owned(),
                             1 => "1 reply".to_owned(),
@@ -517,20 +683,21 @@ impl TomaShell {
                         .text_color(theme.orange)
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| this.open_thread(id, cx)))
-                        .child(div().size(px(7.)).rounded_full().bg(theme.orange))
+                        .child(Icon::Shield.view().size(px(13.)))
                         .child("Needs your approval")
                 }))
                 .children(
                     (!working.is_empty())
                         .then(|| typing_indicator(&working, &format!("typing-{id}"), theme)),
                 )
+                .children(stats_row(stats, theme))
         });
 
         div()
             .flex()
             .gap_3()
             .py_2()
-            .child(avatar(&author, message.author, theme))
+            .child(avatar(&author, color))
             .child(
                 div()
                     .min_w(px(0.))
@@ -565,6 +732,7 @@ impl TomaShell {
         let replies: Vec<_> = self.model.messages_for(Some(thread_id)).cloned().collect();
         let reply_count = replies.len();
         let working = self.model.working_agents(thread_id);
+        let stats = self.model.thread_stats(thread_id);
         let requests: Vec<_> = self
             .model
             .snapshot
@@ -575,12 +743,19 @@ impl TomaShell {
             .collect();
         let cards: Vec<_> = requests
             .into_iter()
-            .map(|request| self.permission_card(request, theme, cx).into_any_element())
+            .filter_map(|request| {
+                let buttons = self.request_buttons.get(&request.id)?.clone();
+                Some(
+                    self.permission_card(request, buttons, theme, cx)
+                        .into_any_element(),
+                )
+            })
             .collect();
 
         Some(
             div()
-                .w(px(400.))
+                .relative()
+                .w(px(self.thread_width))
                 .h_full()
                 .flex_shrink_0()
                 .flex()
@@ -614,11 +789,11 @@ impl TomaShell {
                                     div()
                                         .flex()
                                         .items_center()
-                                        .gap_1()
+                                        .gap_2()
                                         .text_size(px(11.))
                                         .text_color(theme.text_secondary)
-                                        .child(status_dot(thread.status, theme))
-                                        .child(status_label(thread.status)),
+                                        .child(status_label(thread.status))
+                                        .children(stats_row(stats, theme)),
                                 ),
                         )
                         .child(
@@ -630,12 +805,11 @@ impl TomaShell {
                                 .items_center()
                                 .justify_center()
                                 .rounded(px(6.))
-                                .text_size(px(12.))
                                 .text_color(theme.text_secondary)
                                 .cursor_pointer()
                                 .hover(|button| button.bg(theme.hover))
                                 .on_click(cx.listener(|this, _, _, cx| this.close_thread(cx)))
-                                .child("✕"),
+                                .child(Icon::Close.view().size(px(14.))),
                         ),
                 )
                 .child(
@@ -680,6 +854,25 @@ impl TomaShell {
                         .pb_4()
                         .pt_1()
                         .child(self.thread_composer.clone()),
+                )
+                // Drag handle over the divider; the root follows the drag.
+                .child(
+                    div()
+                        .id("thread-divider")
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(-3.))
+                        .w(px(6.))
+                        .cursor_col_resize()
+                        .when(self.resizing_thread, |handle| handle.bg(theme.accent))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.resizing_thread = true;
+                                cx.notify();
+                            }),
+                        ),
                 ),
         )
     }
@@ -687,6 +880,7 @@ impl TomaShell {
     fn permission_card(
         &self,
         request: PermissionRequest,
+        (deny_focus, allow_focus): (FocusHandle, FocusHandle),
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -694,19 +888,22 @@ impl TomaShell {
             .model
             .author_name(MessageAuthor::Agent(request.agent_id))
             .to_owned();
-        let button = |id: &str, label: &'static str| {
-            div()
-                .id(SharedString::from(format!("{id}-{}", request.id)))
-                .px_3()
-                .py(px(3.))
-                .rounded(px(6.))
-                .text_size(px(12.))
-                .font_weight(FontWeight::MEDIUM)
-                .cursor_pointer()
-                .child(label)
+        let entity = cx.entity();
+        let answer = |allow: bool| -> OnPress {
+            let entity = entity.clone();
+            let request = request.clone();
+            Rc::new(move |_, cx| {
+                entity.update(cx, |shell, cx| {
+                    shell.answer_permission(&request, allow, cx);
+                    cx.notify();
+                })
+            })
         };
-        let (deny, allow) = (request.clone(), request.clone());
+        let deny = answer(false);
+        let escape = Rc::clone(&deny);
         div()
+            .key_context("Dialog")
+            .on_action(move |_: &Cancel, window, cx| escape(window, cx))
             .my_2()
             .p_3()
             .rounded(px(8.))
@@ -718,7 +915,7 @@ impl TomaShell {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().size(px(7.)).rounded_full().bg(theme.orange))
+                    .child(Icon::Shield.view().size(px(15.)).text_color(theme.orange))
                     .child(
                         div()
                             .font_weight(FontWeight::SEMIBOLD)
@@ -740,36 +937,43 @@ impl TomaShell {
                 div()
                     .mt_3()
                     .flex()
+                    .items_center()
                     .justify_end()
                     .gap_2()
                     .child(
-                        button("deny", "Deny")
-                            .border_1()
-                            .border_color(theme.separator)
-                            .hover(|b| b.opacity(0.8))
-                            .on_click(cx.listener(move |this, _, _, _| {
-                                this.answer_permission(&deny, false)
-                            })),
+                        div()
+                            .flex_grow()
+                            .text_size(px(11.))
+                            .text_color(theme.text_tertiary)
+                            .child("⏎ choose · ⇥ switch · esc deny"),
                     )
-                    .child(
-                        button("allow", "Allow")
-                            .bg(theme.accent)
-                            .text_color(gpui::white())
-                            .hover(|b| b.opacity(0.85))
-                            .on_click(cx.listener(move |this, _, _, _| {
-                                this.answer_permission(&allow, true)
-                            })),
-                    ),
+                    .child(button(
+                        SharedString::from(format!("deny-{}", request.id)),
+                        "Deny",
+                        &deny_focus,
+                        ButtonStyle::Secondary,
+                        theme,
+                        deny,
+                    ))
+                    .child(button(
+                        SharedString::from(format!("allow-{}", request.id)),
+                        "Allow",
+                        &allow_focus,
+                        ButtonStyle::Primary,
+                        theme,
+                        answer(true),
+                    )),
             )
     }
 
     fn thread_message(&self, message: Message, theme: &Theme) -> impl IntoElement {
         let author = self.model.author_name(message.author).to_owned();
+        let color = self.author_color(message.author, theme);
         div()
             .flex()
             .gap_2()
             .py_2()
-            .child(avatar(&author, message.author, theme))
+            .child(avatar(&author, color))
             .child(
                 div()
                     .min_w(px(0.))
@@ -785,7 +989,7 @@ impl TomaShell {
 }
 
 impl Render for TomaShell {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx);
         let messages = self.model.snapshot.messages.len();
         if messages != self.seen_messages {
@@ -793,12 +997,33 @@ impl Render for TomaShell {
             self.channel_scroll.scroll_to_bottom();
             self.thread_scroll.scroll_to_bottom();
         }
-        div()
+        self.prepare_request_focus(window, cx);
+        if let Some(focus) = self.pending_focus.take() {
+            window.focus(&focus);
+        }
+        focus_navigation(div())
             .size_full()
             .flex()
             .font_family(".SystemUIFont")
             .text_size(px(13.))
             .text_color(theme.text)
+            .when(self.resizing_thread, |root| root.cursor_col_resize())
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                if this.resizing_thread {
+                    let width = (window.viewport_size().width - event.position.x) / px(1.);
+                    this.thread_width = width.clamp(THREAD_WIDTH.0, THREAD_WIDTH.1);
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.resizing_thread {
+                        this.resizing_thread = false;
+                        cx.notify();
+                    }
+                }),
+            )
             .child(self.sidebar(&theme, cx))
             .child(self.conversation(&theme, cx))
             .children(self.thread_pane(&theme, cx))
@@ -848,12 +1073,7 @@ fn sidebar_row(
         .when(!selected, |row| row.hover(move |row| row.bg(hover)))
 }
 
-fn avatar(name: &str, author: MessageAuthor, theme: &Theme) -> impl IntoElement {
-    let color: Hsla = match author {
-        MessageAuthor::Agent(_) => theme.accent,
-        MessageAuthor::Person(_) => theme.green,
-        MessageAuthor::System => theme.gray,
-    };
+fn avatar(name: &str, color: Hsla) -> impl IntoElement {
     div()
         .mt(px(2.))
         .size(px(28.))
@@ -866,13 +1086,30 @@ fn avatar(name: &str, author: MessageAuthor, theme: &Theme) -> impl IntoElement 
         .text_size(px(12.))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(gpui::white())
-        .child(
-            name.chars()
-                .next()
-                .unwrap_or('?')
-                .to_uppercase()
-                .to_string(),
-        )
+        .child(initial(name))
+}
+
+fn mini_avatar(name: &str, color: Hsla) -> impl IntoElement {
+    div()
+        .size(px(14.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.))
+        .bg(color)
+        .text_size(px(9.))
+        .font_weight(FontWeight::BOLD)
+        .text_color(gpui::white())
+        .child(initial(name))
+}
+
+fn initial(name: &str) -> String {
+    name.chars()
+        .next()
+        .unwrap_or('?')
+        .to_uppercase()
+        .to_string()
 }
 
 fn message_header(author: &str, created_at: TimestampMs, theme: &Theme) -> impl IntoElement {
@@ -891,6 +1128,58 @@ fn message_header(author: &str, created_at: TimestampMs, theme: &Theme) -> impl 
                 .text_color(theme.text_tertiary)
                 .child(time_label(created_at)),
         )
+}
+
+/// Time, tokens and cost across a thread's runs, omitting what providers did not report.
+fn stats_row(stats: ThreadStats, theme: &Theme) -> Option<impl IntoElement> {
+    if stats.runs == 0 {
+        return None;
+    }
+    let chip = |icon: Icon, text: String| {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(3.))
+            .child(icon.view().size(px(11.)))
+            .child(text)
+    };
+    Some(
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_size(px(11.))
+            .text_color(theme.text_tertiary)
+            .child(chip(Icon::Clock, format_duration(stats.duration_ms)))
+            .children((stats.tokens > 0).then(|| {
+                chip(
+                    Icon::Tokens,
+                    format!("{} tokens", format_tokens(stats.tokens)),
+                )
+            }))
+            .children(
+                stats
+                    .cost_micros
+                    .map(|cost| div().child(format!("${:.2}", cost as f64 / 1_000_000.))),
+            ),
+    )
+}
+
+fn format_duration(ms: i64) -> String {
+    let seconds = ms / 1000;
+    match seconds {
+        ..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m {}s", seconds / 60, seconds % 60),
+        _ => format!("{}h {}m", seconds / 3600, seconds % 3600 / 60),
+    }
+}
+
+fn format_tokens(tokens: i64) -> String {
+    match tokens {
+        ..1000 => tokens.to_string(),
+        1000..1_000_000 => format!("{:.1}k", tokens as f64 / 1000.),
+        _ => format!("{:.1}M", tokens as f64 / 1_000_000.),
+    }
 }
 
 fn typing_indicator(agents: &[&str], id: &str, theme: &Theme) -> AnyElement {
@@ -937,8 +1226,21 @@ fn status_dot(status: WorkStatus, theme: &Theme) -> impl IntoElement {
     div().size(px(7.)).flex_shrink_0().rounded_full().bg(color)
 }
 
-fn status_label(status: WorkStatus) -> &'static str {
+fn status_emoji(status: WorkStatus) -> &'static str {
     match status {
+        WorkStatus::Queued => "⏳",
+        WorkStatus::Reading => "👀",
+        WorkStatus::Working => "⚡",
+        WorkStatus::WaitingForInput => "✋",
+        WorkStatus::Blocked => "🧱",
+        WorkStatus::Completed => "✅",
+        WorkStatus::Failed => "❌",
+        WorkStatus::Cancelled => "🚫",
+    }
+}
+
+fn status_label(status: WorkStatus) -> String {
+    let label = match status {
         WorkStatus::Queued => "Queued",
         WorkStatus::Reading => "Reading",
         WorkStatus::Working => "Working",
@@ -947,7 +1249,8 @@ fn status_label(status: WorkStatus) -> &'static str {
         WorkStatus::Completed => "Done",
         WorkStatus::Failed => "Failed",
         WorkStatus::Cancelled => "Cancelled",
-    }
+    };
+    format!("{} {label}", status_emoji(status))
 }
 
 /// Local wall-clock time, or the date for messages older than today.
@@ -986,5 +1289,20 @@ impl Render for Tooltip {
             .text_size(px(11.))
             .text_color(theme.text)
             .child(self.0.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stats_are_formatted_compactly() {
+        assert_eq!(format_duration(42_000), "42s");
+        assert_eq!(format_duration(192_000), "3m 12s");
+        assert_eq!(format_duration(3_900_000), "1h 5m");
+        assert_eq!(format_tokens(950), "950");
+        assert_eq!(format_tokens(12_400), "12.4k");
+        assert_eq!(format_tokens(2_300_000), "2.3M");
     }
 }

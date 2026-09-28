@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use toma_core::{SystemClock, TomaCore};
-use toma_runner::{ClaudeCodeRunner, CodexCliRunner};
+use toma_runner::{ClaudeCodeRunner, CodexCliRunner, CursorCliRunner};
 use toma_storage::SqliteStore;
 use toma_worktree::GitWorktreeManager;
 
@@ -40,6 +40,7 @@ fn main() -> anyhow::Result<()> {
         vec![
             Arc::new(ClaudeCodeRunner::new().with_approvals(std::env::current_exe()?)),
             Arc::new(CodexCliRunner::new()),
+            Arc::new(CursorCliRunner::new()),
         ],
         Arc::new(SystemClock),
     ));

@@ -1,4 +1,6 @@
 mod composer;
+mod controls;
+mod icons;
 mod markdown;
 mod shell;
 mod theme;
@@ -30,28 +32,31 @@ pub fn run_with_snapshot(snapshot: WorkspaceSnapshot) {
 }
 
 fn open(snapshot: WorkspaceSnapshot, backend: Option<(Arc<TomaCore>, WorkspaceId)>) {
-    Application::new().run(move |cx: &mut App| {
-        cx.set_global(Theme::for_appearance(cx.window_appearance()));
-        bind_keys(cx);
-        let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(900.), px(560.))),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Toma".into()),
-                    appears_transparent: true,
-                    traffic_light_position: Some(point(px(18.), px(18.))),
-                }),
-                // Lets the translucent sidebar show the desktop through, like Finder or Mail.
-                window_background: WindowBackgroundAppearance::Blurred,
-                ..Default::default()
-            },
-            |window, cx| shell::TomaShell::new(snapshot, backend, window, cx),
-        )
-        .expect("failed to open the Toma window");
-        cx.activate(true);
-    });
+    Application::new()
+        .with_assets(icons::Assets)
+        .run(move |cx: &mut App| {
+            cx.set_global(Theme::for_appearance(cx.window_appearance()));
+            bind_keys(cx);
+            controls::bind_keys(cx);
+            let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_min_size: Some(size(px(900.), px(560.))),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("Toma".into()),
+                        appears_transparent: true,
+                        traffic_light_position: Some(point(px(18.), px(18.))),
+                    }),
+                    // Lets the translucent sidebar show the desktop through, like Finder or Mail.
+                    window_background: WindowBackgroundAppearance::Blurred,
+                    ..Default::default()
+                },
+                |window, cx| shell::TomaShell::new(snapshot, backend, window, cx),
+            )
+            .expect("failed to open the Toma window");
+            cx.activate(true);
+        });
 }
 
 /// Runs a self-contained sample shell for visual development.

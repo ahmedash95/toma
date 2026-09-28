@@ -5,7 +5,7 @@ use std::{sync::Arc, thread, time::Duration};
 
 use toma_core::{SystemClock, TomaCore};
 use toma_domain::*;
-use toma_runner::ClaudeCodeRunner;
+use toma_runner::{ClaudeCodeRunner, CursorCliRunner};
 use toma_storage::SqliteStore;
 use toma_worktree::GitWorktreeManager;
 
@@ -98,5 +98,62 @@ fn claude_waits_for_the_person_through_the_bridge() {
     assert!(
         !std::path::Path::new("/private/tmp/toma-approval-probe").exists(),
         "denied command must not run"
+    );
+}
+
+#[test]
+#[ignore = "calls the real Claude and Cursor CLIs"]
+fn claude_hands_off_to_cursor_by_mentioning_it() {
+    let state = tempfile::TempDir::new().unwrap();
+    let folder = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(SqliteStore::open(state.path().join("toma.db")).unwrap());
+    let workspace_id = store.seed_demo_workspace(state.path()).unwrap();
+    let core = TomaCore::new(
+        store,
+        Arc::new(GitWorktreeManager),
+        vec![
+            Arc::new(ClaudeCodeRunner::new()),
+            Arc::new(CursorCliRunner::new()),
+        ],
+        Arc::new(SystemClock),
+    );
+    let snapshot = core.recover(workspace_id).unwrap();
+    let agent = |name: &str| snapshot.agents.iter().find(|a| a.name == name).unwrap().id;
+    let (claude, cursor) = (agent("Claude"), agent("Cursor"));
+    let Some(AppEvent::ChannelCreated { channel_id }) = core
+        .dispatch(AppCommand::CreateChannel {
+            workspace_id,
+            repository_path: folder.path().to_owned(),
+        })
+        .unwrap()
+        .first()
+        .cloned()
+    else {
+        panic!("no channel");
+    };
+
+    core.dispatch(AppCommand::PostMessage {
+        channel_id,
+        thread_id: None,
+        body: "@Claude don't answer this yourself: ask @Cursor what 17 times 3 is, by \
+               mentioning it in a one-line reply."
+            .into(),
+        attachments: vec![AttachmentTarget::Agent { agent_id: claude }],
+    })
+    .unwrap();
+    let live = core.cached_snapshot(workspace_id).unwrap();
+    for message in &live.messages {
+        println!("{:?}: {}", message.author, message.body);
+    }
+    let cursor_reply = live
+        .messages
+        .iter()
+        .find(|m| m.author == MessageAuthor::Agent(cursor))
+        .expect("Cursor never replied");
+    assert!(cursor_reply.body.contains("51"), "{}", cursor_reply.body);
+    assert!(
+        live.usages.len() >= 2,
+        "both runs report usage: {:?}",
+        live.usages
     );
 }

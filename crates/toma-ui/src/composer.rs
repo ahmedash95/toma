@@ -441,7 +441,7 @@ impl Composer {
     ) -> Self {
         Self {
             model: ComposerModel::new(text, mentions),
-            focus_handle: cx.focus_handle(),
+            focus_handle: cx.focus_handle().tab_stop(true),
             placeholder: placeholder.into(),
             marked_range: None,
             layout: Layout::default(),
@@ -544,11 +544,12 @@ impl Composer {
         }
     }
 
-    fn tab(&mut self, _: &act::Tab, _: &mut Window, cx: &mut Context<Self>) {
+    fn tab(&mut self, _: &act::Tab, window: &mut Window, cx: &mut Context<Self>) {
         if self.model.palette_open() && self.model.accept_mention() {
             self.changed(cx);
         } else {
-            cx.propagate();
+            // Tab is bound here for the mention palette; otherwise it moves focus as usual.
+            window.focus_next();
         }
     }
 

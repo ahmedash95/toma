@@ -279,7 +279,6 @@ impl TomaCore {
             let created = self.create_thread(workspace_id, &message, agent_ids[0])?;
             events.extend(created.events);
             self.execute_run(
-                workspace_id,
                 created.thread_id,
                 created.session_id,
                 created.run_id,
@@ -375,15 +374,7 @@ impl TomaCore {
                 session_id: session.id,
             },
         ];
-        self.execute_run(
-            workspace_id,
-            thread_id,
-            session.id,
-            run.id,
-            prompt,
-            &mut events,
-            hops,
-        )?;
+        self.execute_run(thread_id, session.id, run.id, prompt, &mut events, hops)?;
         Ok(events)
     }
 
@@ -460,15 +451,7 @@ impl TomaCore {
             run_id: run.id,
             session_id,
         }];
-        self.execute_run(
-            workspace_id,
-            thread_id,
-            session_id,
-            run.id,
-            prompt,
-            &mut events,
-            hops,
-        )?;
+        self.execute_run(thread_id, session_id, run.id, prompt, &mut events, hops)?;
         Ok(events)
     }
 
@@ -543,7 +526,6 @@ impl TomaCore {
 
     fn execute_run(
         &self,
-        workspace_id: WorkspaceId,
         thread_id: ThreadId,
         session_id: SessionId,
         run_id: RunId,
@@ -551,6 +533,7 @@ impl TomaCore {
         events: &mut Vec<AppEvent>,
         hops: u8,
     ) -> Result<(), CoreError> {
+        let workspace_id = self.workspace_for_thread(thread_id)?;
         let first_event = events.len();
         let (provider, provider_session_id, agent_id) = {
             let state = self.state()?;
