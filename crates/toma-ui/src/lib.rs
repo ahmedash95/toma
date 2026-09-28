@@ -1,8 +1,10 @@
 mod composer;
 mod shell;
+mod theme;
 mod view_model;
 
 pub use composer::{ComposerModel, MentionCandidate};
+pub use theme::Theme;
 pub use view_model::{ContextKey, ShellViewModel};
 
 use std::sync::Arc;
@@ -24,6 +26,7 @@ pub fn run_with_snapshot(snapshot: WorkspaceSnapshot) {
 
 fn open(snapshot: WorkspaceSnapshot, backend: Option<(Arc<TomaCore>, WorkspaceId)>) {
     Application::new().run(move |cx: &mut App| {
+        cx.set_global(Theme::for_appearance(cx.window_appearance()));
         let bounds = Bounds::centered(None, size(px(1180.), px(760.)), cx);
         cx.open_window(
             WindowOptions {
