@@ -267,21 +267,13 @@ impl TomaCore {
                 agent_ids = sessions.iter().map(|(agent_id, _)| *agent_id).collect();
             }
             for agent_id in agent_ids {
-                match sessions.iter().find(|(id, _)| *id == agent_id) {
-                    Some((_, session_id)) => events.extend(self.continue_session(
-                        workspace_id,
-                        thread_id,
-                        *session_id,
-                        &message.body,
-                    )?),
-                    None => events.extend(self.attach_agent_with_prompt(
-                        workspace_id,
-                        thread_id,
-                        agent_id,
-                        &message.body,
-                        false,
-                    )?),
-                }
+                events.extend(self.run_agent_in_thread(
+                    workspace_id,
+                    thread_id,
+                    agent_id,
+                    &message.body,
+                    0,
+                )?);
             }
         } else if !agent_ids.is_empty() {
             let created = self.create_thread(workspace_id, &message, agent_ids[0])?;
@@ -293,14 +285,15 @@ impl TomaCore {
                 created.run_id,
                 &message.body,
                 &mut events,
+                0,
             )?;
             for agent_id in agent_ids.into_iter().skip(1) {
-                events.extend(self.attach_agent_with_prompt(
+                events.extend(self.run_agent_in_thread(
                     workspace_id,
                     created.thread_id,
                     agent_id,
                     &message.body,
-                    false,
+                    0,
                 )?);
             }
         }
@@ -314,7 +307,7 @@ impl TomaCore {
     ) -> Result<Vec<AppEvent>, CoreError> {
         let workspace_id = self.workspace_for_thread(thread_id)?;
         let prompt = self.root_prompt(workspace_id, thread_id)?;
-        self.attach_agent_with_prompt(workspace_id, thread_id, agent_id, &prompt, true)
+        self.attach_agent_with_prompt(workspace_id, thread_id, agent_id, &prompt, true, 0)
     }
 
     fn attach_agent_with_prompt(
@@ -324,6 +317,7 @@ impl TomaCore {
         agent_id: AgentId,
         prompt: &str,
         reject_duplicate: bool,
+        hops: u8,
     ) -> Result<Vec<AppEvent>, CoreError> {
         let agent = self.agent(workspace_id, agent_id)?;
         if !agent.enabled {
@@ -388,8 +382,42 @@ impl TomaCore {
             run.id,
             prompt,
             &mut events,
+            hops,
         )?;
         Ok(events)
+    }
+
+    /// Runs `agent_id` in the thread: resumes its session if it has one, otherwise joins it.
+    fn run_agent_in_thread(
+        &self,
+        workspace_id: WorkspaceId,
+        thread_id: ThreadId,
+        agent_id: AgentId,
+        prompt: &str,
+        hops: u8,
+    ) -> Result<Vec<AppEvent>, CoreError> {
+        let session_id = {
+            let state = self.state()?;
+            let snapshot = state.snapshots.get(&workspace_id).expect("validated");
+            snapshot
+                .sessions
+                .iter()
+                .find(|session| session.thread_id == thread_id && session.agent_id == agent_id)
+                .map(|session| session.id)
+        };
+        match session_id {
+            Some(session_id) => {
+                self.continue_session(workspace_id, thread_id, session_id, prompt, hops)
+            }
+            None => self.attach_agent_with_prompt(
+                workspace_id,
+                thread_id,
+                agent_id,
+                prompt,
+                false,
+                hops,
+            ),
+        }
     }
 
     /// Starts the next run of an existing session, which resumes the provider's conversation.
@@ -399,6 +427,7 @@ impl TomaCore {
         thread_id: ThreadId,
         session_id: SessionId,
         prompt: &str,
+        hops: u8,
     ) -> Result<Vec<AppEvent>, CoreError> {
         let sequence = {
             let state = self.state()?;
@@ -438,6 +467,7 @@ impl TomaCore {
             run.id,
             prompt,
             &mut events,
+            hops,
         )?;
         Ok(events)
     }
@@ -519,8 +549,10 @@ impl TomaCore {
         run_id: RunId,
         prompt: &str,
         events: &mut Vec<AppEvent>,
+        hops: u8,
     ) -> Result<(), CoreError> {
-        let (provider, provider_session_id, instructions) = {
+        let first_event = events.len();
+        let (provider, provider_session_id, agent_id) = {
             let state = self.state()?;
             let snapshot = state.snapshots.get(&workspace_id).expect("validated");
             let session = snapshot
@@ -534,14 +566,11 @@ impl TomaCore {
                 .find(|agent| agent.id == session.agent_id)
                 .expect("validated agent")
                 .provider;
-            let instructions = snapshot
-                .agents
-                .iter()
-                .find(|agent| agent.id == session.agent_id)
-                .expect("validated agent")
-                .instructions
-                .clone();
-            (provider, session.provider_session_id.clone(), instructions)
+            (
+                provider,
+                session.provider_session_id.clone(),
+                session.agent_id,
+            )
         };
         let runner = self.runner(provider)?;
         let working_directory = match self.working_directory(workspace_id, thread_id) {
@@ -551,7 +580,7 @@ impl TomaCore {
                 return Ok(());
             }
         };
-        let _lease = match self
+        let lease = match self
             .worktrees
             .acquire_write_lock(thread_id, &session_id.to_string())
         {
@@ -566,10 +595,10 @@ impl TomaCore {
             return Ok(());
         }
 
-        let effective_prompt = if instructions.trim().is_empty() {
-            prompt.to_owned()
-        } else {
-            format!("{instructions}\n\n{prompt}")
+        let effective_prompt = {
+            let state = self.state()?;
+            let snapshot = state.snapshots.get(&workspace_id).expect("validated");
+            compose_prompt(snapshot, thread_id, session_id, run_id, prompt)
         };
         // Events are applied as they arrive so replies stream into the cached snapshot.
         let mut sequence = 0;
@@ -593,6 +622,46 @@ impl TomaCore {
         handled?;
         if let Err(error) = result {
             self.fail_run(run_id, error.to_string(), events)?;
+        }
+        drop(lease);
+
+        // Agents talk to each other by @mentioning: each mention in a reply hands the
+        // thread to that agent, up to MAX_HOPS in a row so two agents cannot loop forever.
+        let handoffs: Vec<(AgentId, String)> = {
+            let state = self.state()?;
+            let snapshot = state.snapshots.get(&workspace_id).expect("validated");
+            let replies: Vec<&Message> = events[first_event..]
+                .iter()
+                .filter_map(|event| match event {
+                    AppEvent::MessagePosted { message_id } => {
+                        snapshot.messages.iter().find(|m| m.id == *message_id)
+                    }
+                    _ => None,
+                })
+                .filter(|message| message.author == MessageAuthor::Agent(agent_id))
+                .collect();
+            let from = snapshot
+                .agents
+                .iter()
+                .find(|agent| agent.id == agent_id)
+                .map_or("An agent", |agent| agent.name.as_str());
+            snapshot
+                .agents
+                .iter()
+                .filter(|agent| agent.enabled && agent.id != agent_id)
+                .filter(|agent| {
+                    let mention = format!("@{}", agent.name);
+                    replies.iter().any(|reply| reply.body.contains(&mention))
+                })
+                .map(|agent| (agent.id, format!("{from} mentioned you in this thread.")))
+                .collect()
+        };
+        if hops < MAX_HOPS {
+            for (next, prompt) in handoffs {
+                let more =
+                    self.run_agent_in_thread(workspace_id, thread_id, next, &prompt, hops + 1)?;
+                events.extend(more);
+            }
         }
         Ok(())
     }
@@ -632,6 +701,32 @@ impl TomaCore {
                 events.push(AppEvent::MessagePosted { message_id });
             }
             RunnerEvent::ReplyDelta(_) => unreachable!("handled above"),
+            RunnerEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+                cost_micros,
+                duration_ms,
+            } => {
+                let usage = RunUsage {
+                    run_id,
+                    input_tokens,
+                    output_tokens,
+                    cached_tokens,
+                    cost_micros,
+                    duration_ms,
+                };
+                self.store.save_run_usage(&usage)?;
+                let mut state = self.state()?;
+                if let Some(snapshot) = state
+                    .snapshots
+                    .values_mut()
+                    .find(|snapshot| snapshot.runs.iter().any(|run| run.id == run_id))
+                {
+                    snapshot.usages.retain(|existing| existing.run_id != run_id);
+                    snapshot.usages.push(usage);
+                }
+            }
             RunnerEvent::PermissionRequest {
                 request_id,
                 tool,
@@ -1265,6 +1360,97 @@ fn channel_name(folder: &Path) -> String {
     }
 }
 
+const MAX_HOPS: u8 = 4;
+
+/// The text sent to an agent: its instructions, what it missed in the thread since its last
+/// turn (other agents' replies included), and how to reach the other agents.
+fn compose_prompt(
+    snapshot: &WorkspaceSnapshot,
+    thread_id: ThreadId,
+    session_id: SessionId,
+    run_id: RunId,
+    trigger: &str,
+) -> String {
+    let name_of = |author: MessageAuthor| match author {
+        MessageAuthor::Agent(id) => snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.id == id)
+            .map_or("Agent".to_owned(), |agent| agent.name.clone()),
+        MessageAuthor::Person(id) => snapshot
+            .people
+            .iter()
+            .find(|person| person.id == id)
+            .map_or("Person".to_owned(), |person| person.display_name.clone()),
+        MessageAuthor::System => "Toma".to_owned(),
+    };
+    let Some(session) = snapshot.sessions.iter().find(|s| s.id == session_id) else {
+        return trigger.to_owned();
+    };
+    let me = MessageAuthor::Agent(session.agent_id);
+    let since = snapshot
+        .runs
+        .iter()
+        .filter(|run| run.session_id == session_id && run.id != run_id)
+        .filter_map(|run| run.started_at)
+        .max();
+    let root = snapshot
+        .threads
+        .iter()
+        .find(|thread| thread.id == thread_id)
+        .map(|thread| thread.root_message_id);
+    let unseen: Vec<&Message> = snapshot
+        .messages
+        .iter()
+        .filter(|m| m.thread_id == Some(thread_id) || Some(m.id) == root)
+        .filter(|m| m.author != me && m.author != MessageAuthor::System)
+        .filter(|m| since.is_none_or(|since| m.created_at >= since))
+        .collect();
+
+    let mut prompt = String::new();
+    let agent = snapshot.agents.iter().find(|a| a.id == session.agent_id);
+    if let Some(instructions) = agent
+        .map(|a| a.instructions.trim())
+        .filter(|i| !i.is_empty())
+    {
+        prompt.push_str(instructions);
+        prompt.push_str("\n\n");
+    }
+    match unseen.as_slice() {
+        [only] if only.body == trigger => prompt.push_str(trigger),
+        [] => prompt.push_str(trigger),
+        messages => {
+            prompt.push_str("New messages in this thread since your last turn:\n");
+            for message in messages {
+                prompt.push_str(&format!(
+                    "\n**{}**: {}\n",
+                    name_of(message.author),
+                    message.body
+                ));
+            }
+            if !messages.iter().any(|m| m.body == trigger) {
+                prompt.push_str(&format!("\n{trigger}"));
+            }
+        }
+    }
+    let others: Vec<String> = snapshot
+        .agents
+        .iter()
+        .filter(|a| a.enabled && a.id != session.agent_id)
+        .map(|a| format!("@{}", a.name))
+        .collect();
+    if let (Some(agent), false) = (agent, others.is_empty()) {
+        prompt.push_str(&format!(
+            "\n\n---\nYou are {} in a Toma chat thread with a person and other coding agents ({}). \
+             To ask one of them to act, mention them by @name in your reply; they will see the \
+             thread. Only mention an agent when you need it to do something.",
+            agent.name,
+            others.join(", ")
+        ));
+    }
+    prompt
+}
+
 fn run_owner(
     snapshot: &WorkspaceSnapshot,
     run_id: RunId,
@@ -1316,6 +1502,11 @@ fn raw_payload(event: &RunnerEvent) -> String {
         RunnerEvent::Output(text) => text.clone(),
         RunnerEvent::Reply(text) => format!("reply:{text}"),
         RunnerEvent::ReplyDelta(text) => text.clone(),
+        RunnerEvent::Usage {
+            input_tokens,
+            output_tokens,
+            ..
+        } => format!("usage:{input_tokens}:{output_tokens}"),
         RunnerEvent::PermissionRequest { tool, detail, .. } => {
             format!("permission_request:{tool}:{detail}")
         }

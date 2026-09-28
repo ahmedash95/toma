@@ -24,7 +24,7 @@ macro_rules! from_json {
     };
 }
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const MIGRATION_1: &str = include_str!("migration_1.sql");
 
 #[derive(Debug, Error)]
@@ -68,6 +68,7 @@ pub trait TomaStore: Send + Sync {
         at: TimestampMs,
     ) -> StorageResult<()>;
     fn save_worktree(&self, worktree: &WorktreeRecord) -> StorageResult<()>;
+    fn save_run_usage(&self, usage: &RunUsage) -> StorageResult<()>;
     fn set_provider_session_id(
         &self,
         session_id: SessionId,
@@ -89,6 +90,7 @@ pub struct WorkspaceSnapshot {
     pub drafts: Vec<Draft>,
     pub memories: Vec<ChannelMemory>,
     pub worktrees: Vec<WorktreeRecord>,
+    pub usages: Vec<RunUsage>,
     /// Live-only; never persisted because a restart ends the runs that asked.
     pub permission_requests: Vec<PermissionRequest>,
 }
@@ -182,6 +184,7 @@ impl SqliteStore {
         let codex_id: AgentId = parse_id("018f0000-0000-7000-8000-000000000004")?;
         let claude_id: AgentId = parse_id("018f0000-0000-7000-8000-000000000005")?;
         let person_id: PersonId = parse_id("018f0000-0000-7000-8000-000000000006")?;
+        let cursor_id: AgentId = parse_id("018f0000-0000-7000-8000-000000000007")?;
         let repository_path = repository_path.into();
         let mut connection = self.connection()?;
         let tx = connection.transaction()?;
@@ -206,6 +209,12 @@ impl SqliteStore {
                 "Claude",
                 "coding agent",
                 RunnerProvider::ClaudeCodeCli,
+            ),
+            (
+                cursor_id,
+                "Cursor",
+                "coding agent",
+                RunnerProvider::CursorCli,
             ),
         ] {
             tx.execute(
@@ -291,6 +300,7 @@ impl TomaStore for SqliteStore {
             drafts: query_drafts(&connection, &workspace_key)?,
             memories: query_memories(&connection, &workspace_key)?,
             worktrees: query_worktrees(&connection, &workspace_key)?,
+            usages: query_usages(&connection, &workspace_key)?,
             permission_requests: Vec::new(),
         })
     }
@@ -468,6 +478,25 @@ impl TomaStore for SqliteStore {
         Ok(())
     }
 
+    fn save_run_usage(&self, usage: &RunUsage) -> StorageResult<()> {
+        self.connection()?.execute(
+            "INSERT INTO run_usage (run_id, input_tokens, output_tokens, cached_tokens, cost_micros, duration_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(run_id) DO UPDATE SET input_tokens = excluded.input_tokens,
+                output_tokens = excluded.output_tokens, cached_tokens = excluded.cached_tokens,
+                cost_micros = excluded.cost_micros, duration_ms = excluded.duration_ms",
+            params![
+                usage.run_id.to_string(),
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cached_tokens,
+                usage.cost_micros,
+                usage.duration_ms
+            ],
+        )?;
+        Ok(())
+    }
+
     fn save_worktree(&self, worktree: &WorktreeRecord) -> StorageResult<()> {
         let connection = self.connection()?;
         connection.execute(
@@ -496,6 +525,21 @@ fn migrate(connection: &mut Connection) -> StorageResult<()> {
         let tx = connection.transaction()?;
         tx.execute_batch("ALTER TABLE channels ADD COLUMN repository_path TEXT")?;
         tx.pragma_update(None, "user_version", 2)?;
+        tx.commit()?;
+    }
+    if version < 3 {
+        let tx = connection.transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE run_usage (
+                run_id TEXT PRIMARY KEY NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                cached_tokens INTEGER NOT NULL,
+                cost_micros INTEGER,
+                duration_ms INTEGER
+            )",
+        )?;
+        tx.pragma_update(None, "user_version", 3)?;
         tx.commit()?;
     }
     Ok(())
@@ -721,6 +765,21 @@ query_entities!(
             path: from_json!(&row.get::<_, String>(1)?)?,
             branch: row.get(2)?,
             created_at: row.get(3)?,
+        }))
+    }
+);
+query_entities!(
+    query_usages,
+    RunUsage,
+    "SELECT u.run_id, u.input_tokens, u.output_tokens, u.cached_tokens, u.cost_micros, u.duration_ms FROM run_usage u JOIN runs r ON r.id = u.run_id JOIN sessions s ON s.id = r.session_id JOIN threads t ON t.id = s.thread_id JOIN channels c ON c.id = t.channel_id WHERE c.workspace_id = ?1 ORDER BY u.run_id",
+    |row| -> rusqlite::Result<StorageResult<RunUsage>> {
+        Ok(Ok(RunUsage {
+            run_id: parse_id(&row.get::<_, String>(0)?)?,
+            input_tokens: row.get(1)?,
+            output_tokens: row.get(2)?,
+            cached_tokens: row.get(3)?,
+            cost_micros: row.get(4)?,
+            duration_ms: row.get(5)?,
         }))
     }
 );

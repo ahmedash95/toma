@@ -123,6 +123,11 @@ impl TomaStore for FakeStore {
         Ok(())
     }
 
+    fn save_run_usage(&self, usage: &RunUsage) -> StorageResult<()> {
+        self.snapshot.lock().unwrap().usages.push(usage.clone());
+        Ok(())
+    }
+
     fn save_worktree(&self, worktree: &WorktreeRecord) -> StorageResult<()> {
         self.snapshot
             .lock()
@@ -360,10 +365,12 @@ fn channel_mention_creates_and_runs_a_durable_thread() {
         AppEvent::RunnerOutput { text, .. } if text == "hello"
     )));
     assert_eq!(fixture.store.history.lock().unwrap().len(), 3);
-    assert_eq!(
-        fixture.runner.requests.lock().unwrap()[0].3,
-        "Build the feature"
+    let prompt = fixture.runner.requests.lock().unwrap()[0].3.clone();
+    assert!(
+        prompt.starts_with("Build the feature\n\n---\nYou are Builder"),
+        "{prompt}"
     );
+    assert!(prompt.contains("@Reviewer"));
 }
 
 #[test]
@@ -444,7 +451,7 @@ fn plain_thread_reply_continues_the_existing_agent_session() {
         requests[1].1, requests[0].1,
         "same session, so the provider resumes"
     );
-    assert_eq!(requests[1].3, "Additional context");
+    assert!(requests[1].3.starts_with("Additional context"));
     let snapshot = fixture.store.snapshot.lock().unwrap();
     assert_eq!(snapshot.sessions.len(), 1);
     assert_eq!(snapshot.runs.len(), 2);
@@ -801,4 +808,76 @@ fn permission_requests_wait_for_the_person_and_are_logged() {
             .is_err(),
         "a request is answered once"
     );
+}
+
+fn post_to_builder(fixture: &Fixture, body: &str) {
+    fixture
+        .core
+        .dispatch(AppCommand::PostMessage {
+            channel_id: fixture.channel_id,
+            thread_id: None,
+            body: body.into(),
+            attachments: vec![AttachmentTarget::Agent {
+                agent_id: fixture.agent_id,
+            }],
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_mention_in_a_reply_hands_the_thread_to_that_agent_with_context() {
+    let fixture = fixture_with_events(vec![
+        RunnerEvent::Reply("Done. @Reviewer please check it.".into()),
+        RunnerEvent::Completed,
+    ]);
+    post_to_builder(&fixture, "Build it");
+
+    let requests = fixture.runner.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2, "Builder, then Reviewer");
+    let live = fixture.core.cached_snapshot(fixture.workspace_id).unwrap();
+    let reviewer = live
+        .sessions
+        .iter()
+        .find(|s| s.agent_id == fixture.collaborator_id)
+        .expect("Reviewer joined the thread");
+    assert_eq!(requests[1].1, reviewer.id);
+    let prompt = &requests[1].3;
+    assert!(prompt.contains("**User**: Build it"), "{prompt}");
+    assert!(
+        prompt.contains("**Builder**: Done. @Reviewer please check it."),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("Builder mentioned you in this thread."),
+        "{prompt}"
+    );
+}
+
+#[test]
+fn agents_mentioning_each_other_stop_after_the_hop_limit() {
+    let fixture = fixture_with_events(vec![
+        RunnerEvent::Reply("@Builder @Reviewer over to you".into()),
+        RunnerEvent::Completed,
+    ]);
+    post_to_builder(&fixture, "Start");
+    assert_eq!(fixture.runner.requests.lock().unwrap().len(), 1 + 4);
+}
+
+#[test]
+fn usage_is_stored_and_cached_per_run() {
+    let fixture = fixture_with_events(vec![
+        RunnerEvent::Usage {
+            input_tokens: 100,
+            output_tokens: 20,
+            cached_tokens: 50,
+            cost_micros: Some(1234),
+            duration_ms: Some(900),
+        },
+        RunnerEvent::Completed,
+    ]);
+    post_to_builder(&fixture, "Count");
+    let live = fixture.core.cached_snapshot(fixture.workspace_id).unwrap();
+    assert_eq!(live.usages.len(), 1);
+    assert_eq!(live.usages[0].run_id, live.runs[0].id);
+    assert_eq!(fixture.store.snapshot.lock().unwrap().usages, live.usages);
 }

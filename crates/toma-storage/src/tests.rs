@@ -313,7 +313,7 @@ fn deterministic_demo_seed_is_idempotent() {
         PathBuf::from("/repo")
     );
     assert_eq!(snapshot.channels.len(), 2);
-    assert_eq!(snapshot.agents.len(), 2);
+    assert_eq!(snapshot.agents.len(), 3);
 }
 
 #[test]
@@ -322,5 +322,28 @@ fn missing_workspace_has_an_empty_snapshot() {
     assert_eq!(
         store.snapshot(WorkspaceId::new()).unwrap(),
         WorkspaceSnapshot::default()
+    );
+}
+
+#[test]
+fn run_usage_is_saved_once_per_run_and_loaded_with_the_workspace() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let fixture = Fixture::new(Path::new("/repo"));
+    fixture.persist(&store);
+    let mut usage = RunUsage {
+        run_id: fixture.run.id,
+        input_tokens: 1200,
+        output_tokens: 80,
+        cached_tokens: 900,
+        cost_micros: Some(11_700),
+        duration_ms: Some(2_500),
+    };
+    store.save_run_usage(&usage).unwrap();
+    usage.output_tokens = 90;
+    store.save_run_usage(&usage).unwrap();
+
+    assert_eq!(
+        store.snapshot(fixture.workspace.id).unwrap().usages,
+        vec![usage]
     );
 }
