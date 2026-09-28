@@ -1,9 +1,11 @@
 mod composer;
+mod markdown;
 mod shell;
 mod theme;
 mod view_model;
 
 pub use composer::{ComposerModel, MentionCandidate};
+pub use markdown::render_markdown;
 pub use theme::Theme;
 pub use view_model::{ContextKey, ShellViewModel};
 
