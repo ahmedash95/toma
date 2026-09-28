@@ -307,26 +307,60 @@ impl TomaShell {
         cx.notify();
     }
 
-    fn author_color(&self, author: MessageAuthor, theme: &Theme) -> Hsla {
-        match author {
-            MessageAuthor::Agent(id) => {
-                let provider = self
-                    .model
-                    .snapshot
-                    .agents
-                    .iter()
-                    .find(|agent| agent.id == id)
-                    .map(|agent| agent.provider);
-                match provider {
-                    Some(RunnerProvider::ClaudeCodeCli) => rgb(0xd97757).into(),
-                    Some(RunnerProvider::CodexCli) => rgb(0x10a37f).into(),
-                    Some(RunnerProvider::CursorCli) => rgb(0x5b5bd6).into(),
-                    None => theme.gray,
-                }
-            }
-            MessageAuthor::Person(_) => theme.accent,
-            MessageAuthor::System => theme.gray,
+    /// A round badge: the provider's logo for agents, an initial for people.
+    fn avatar(&self, author: MessageAuthor, size: f32, theme: &Theme) -> AnyElement {
+        let provider = match author {
+            MessageAuthor::Agent(id) => self
+                .model
+                .snapshot
+                .agents
+                .iter()
+                .find(|agent| agent.id == id)
+                .map(|agent| agent.provider),
+            _ => None,
+        };
+        let (background, logo): (Hsla, _) = match (author, provider) {
+            (_, Some(RunnerProvider::ClaudeCodeCli)) => (rgb(0xd97757).into(), Some(Icon::Claude)),
+            (_, Some(RunnerProvider::CursorCli)) => (rgb(0x14120b).into(), Some(Icon::Cursor)),
+            (_, Some(RunnerProvider::CodexCli)) => (rgb(0x0d0d0d).into(), Some(Icon::OpenAi)),
+            (MessageAuthor::Person(_), _) => (theme.accent, None),
+            _ => (theme.gray, None),
+        };
+        let badge = div()
+            .size(px(size))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(background);
+        match logo {
+            Some(logo) => badge
+                .child(logo.view(gpui::white()).size(px(size * 0.6)))
+                .into_any_element(),
+            None => badge
+                .text_size(px(size * 0.45))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(gpui::white())
+                .child(initial(self.model.author_name(author)))
+                .into_any_element(),
         }
+    }
+
+    /// Overlapping badges, like the viewers in a shared document.
+    fn avatar_stack(&self, authors: &[MessageAuthor], size: f32, theme: &Theme) -> AnyElement {
+        div()
+            .flex()
+            .flex_shrink_0()
+            .children(authors.iter().enumerate().map(|(index, author)| {
+                div()
+                    .when(index > 0, |badge| badge.ml(px(-size * 0.3)))
+                    .rounded_full()
+                    .border_2()
+                    .border_color(theme.content_bg)
+                    .child(self.avatar(*author, size, theme))
+            }))
+            .into_any_element()
     }
 
     /// Gives each visible permission request its buttons, and focuses Allow the first time
@@ -380,12 +414,14 @@ impl TomaShell {
                     .model
                     .thread_agents(thread.id)
                     .into_iter()
-                    .map(|(agent, status)| {
-                        let color = self.author_color(MessageAuthor::Agent(agent.id), theme);
-                        (agent.name.clone(), color, status)
-                    })
+                    .map(|(agent, _)| MessageAuthor::Agent(agent.id))
                     .collect();
-                (thread.id, thread.title.clone(), thread.status, agents)
+                (
+                    thread.id,
+                    thread.title.clone(),
+                    thread.status,
+                    self.avatar_stack(&agents, 16., theme),
+                )
             })
             .collect();
 
@@ -454,47 +490,13 @@ impl TomaShell {
                     }))
                     .children(threads.into_iter().enumerate().map(
                         |(index, (id, title, status, agents))| {
-                            let open = open_thread == Some(id);
-                            div()
-                                .child(
-                                    sidebar_row(("thread", index), open, theme)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.open_thread(id, cx)
-                                        }))
-                                        .child(status_dot(status, theme))
-                                        .child(div().flex_grow().truncate().child(title)),
+                            sidebar_row(("thread", index), open_thread == Some(id), theme)
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.open_thread(id, cx)),
                                 )
-                                // Every agent working in the thread nests under it.
-                                .children(agents.into_iter().enumerate().map(
-                                    |(agent_index, (name, color, status))| {
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "thread-{index}-agent-{agent_index}"
-                                            )))
-                                            .h(px(22.))
-                                            .ml(px(18.))
-                                            .px_2()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .border_l_1()
-                                            .border_color(theme.separator)
-                                            .text_size(px(12.))
-                                            .text_color(theme.text_secondary)
-                                            .cursor_pointer()
-                                            .hover(|row| row.bg(theme.hover))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.open_thread(id, cx)
-                                            }))
-                                            .child(mini_avatar(&name, color))
-                                            .child(div().flex_grow().truncate().child(name))
-                                            .child(
-                                                div()
-                                                    .text_size(px(11.))
-                                                    .child(status_emoji(status)),
-                                            )
-                                    },
-                                ))
+                                .child(status_dot(status, theme))
+                                .child(div().flex_grow().min_w(px(0.)).truncate().child(title))
+                                .child(agents)
                         },
                     )),
             )
@@ -610,7 +612,6 @@ impl TomaShell {
 
     fn message_row(&self, message: Message, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let author = self.model.author_name(message.author).to_owned();
-        let color = self.author_color(message.author, theme);
         let thread = self
             .model
             .snapshot
@@ -632,13 +633,9 @@ impl TomaShell {
                 .model
                 .thread_agents(id)
                 .into_iter()
-                .map(|(agent, _)| {
-                    (
-                        agent.name.clone(),
-                        self.author_color(MessageAuthor::Agent(agent.id), theme),
-                    )
-                })
+                .map(|(agent, _)| MessageAuthor::Agent(agent.id))
                 .collect();
+            let agents = self.avatar_stack(&agents, 18., theme);
             let stats = self.model.thread_stats(id);
             let needs_approval = self
                 .model
@@ -664,7 +661,7 @@ impl TomaShell {
                         .cursor_pointer()
                         .hover(|link| link.underline())
                         .on_click(cx.listener(move |this, _, _, cx| this.open_thread(id, cx)))
-                        .children(agents.iter().map(|(name, color)| mini_avatar(name, *color)))
+                        .child(agents)
                         .child(Icon::Replies.view(theme.accent).size(px(13.)))
                         .child(match replies {
                             0 => "Open thread".to_owned(),
@@ -697,7 +694,11 @@ impl TomaShell {
             .flex()
             .gap_3()
             .py_2()
-            .child(avatar(&author, color))
+            .child(
+                div()
+                    .mt(px(2.))
+                    .child(self.avatar(message.author, 28., theme)),
+            )
             .child(
                 div()
                     .min_w(px(0.))
@@ -1049,12 +1050,15 @@ impl TomaShell {
 
     fn thread_message(&self, message: Message, theme: &Theme) -> impl IntoElement {
         let author = self.model.author_name(message.author).to_owned();
-        let color = self.author_color(message.author, theme);
         div()
             .flex()
             .gap_2()
             .py_2()
-            .child(avatar(&author, color))
+            .child(
+                div()
+                    .mt(px(2.))
+                    .child(self.avatar(message.author, 28., theme)),
+            )
             .child(
                 div()
                     .min_w(px(0.))
@@ -1157,37 +1161,6 @@ fn sidebar_row(
         .cursor_pointer()
         .when(selected, |row| row.bg(theme.selection))
         .when(!selected, |row| row.hover(move |row| row.bg(hover)))
-}
-
-fn avatar(name: &str, color: Hsla) -> impl IntoElement {
-    div()
-        .mt(px(2.))
-        .size(px(28.))
-        .flex_shrink_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(7.))
-        .bg(color)
-        .text_size(px(12.))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(gpui::white())
-        .child(initial(name))
-}
-
-fn mini_avatar(name: &str, color: Hsla) -> impl IntoElement {
-    div()
-        .size(px(14.))
-        .flex_shrink_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(4.))
-        .bg(color)
-        .text_size(px(9.))
-        .font_weight(FontWeight::BOLD)
-        .text_color(gpui::white())
-        .child(initial(name))
 }
 
 fn initial(name: &str) -> String {

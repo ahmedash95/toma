@@ -14,6 +14,10 @@ pub enum Icon {
     Shield,
     Check,
     Ban,
+    // Brand marks from Simple Icons (CC0), filled single paths.
+    Claude,
+    Cursor,
+    OpenAi,
 }
 
 impl Icon {
@@ -37,6 +41,7 @@ impl Icon {
             }
             Icon::Check => r#"<path d="m5 12.5 4.5 4.5L19 7"/>"#,
             Icon::Ban => r#"<circle cx="12" cy="12" r="9"/><path d="m5.6 5.6 12.8 12.8"/>"#,
+            Icon::Claude | Icon::Cursor | Icon::OpenAi => "",
         }
     }
 
@@ -50,7 +55,7 @@ impl Icon {
     }
 }
 
-const ALL: [Icon; 10] = [
+const ALL: [Icon; 13] = [
     Icon::Hash,
     Icon::Folder,
     Icon::Plus,
@@ -61,6 +66,9 @@ const ALL: [Icon; 10] = [
     Icon::Shield,
     Icon::Check,
     Icon::Ban,
+    Icon::Claude,
+    Icon::Cursor,
+    Icon::OpenAi,
 ];
 
 /// Serves the icons to GPUI's `svg()` element.
@@ -68,14 +76,17 @@ pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        Ok(ALL.iter().find(|icon| icon.path() == path).map(|icon| {
-            Cow::Owned(
+        Ok(ALL.iter().find(|icon| icon.path() == path).map(|icon| match icon {
+            Icon::Claude => Cow::Borrowed(&include_bytes!("../assets/logos/claude.svg")[..]),
+            Icon::Cursor => Cow::Borrowed(&include_bytes!("../assets/logos/cursor.svg")[..]),
+            Icon::OpenAi => Cow::Borrowed(&include_bytes!("../assets/logos/openai.svg")[..]),
+            line => Cow::Owned(
                 format!(
                     r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">{}</svg>"#,
-                    icon.body()
+                    line.body()
                 )
                 .into_bytes(),
-            )
+            ),
         }))
     }
 
