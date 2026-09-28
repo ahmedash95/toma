@@ -16,6 +16,8 @@ pub struct Channel {
     pub workspace_id: WorkspaceId,
     pub name: String,
     pub position: i64,
+    /// Folder agents work in; `None` uses the workspace repository.
+    pub repository_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

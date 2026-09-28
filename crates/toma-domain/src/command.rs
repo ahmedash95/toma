@@ -7,6 +7,10 @@ pub enum AppCommand {
     OpenWorkspace {
         repository_path: PathBuf,
     },
+    CreateChannel {
+        workspace_id: WorkspaceId,
+        repository_path: PathBuf,
+    },
     SelectChannel {
         channel_id: ChannelId,
     },

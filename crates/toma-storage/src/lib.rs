@@ -24,7 +24,7 @@ macro_rules! from_json {
     };
 }
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const MIGRATION_1: &str = include_str!("migration_1.sql");
 
 #[derive(Debug, Error)]
@@ -53,6 +53,7 @@ pub trait TomaStore: Send + Sync {
     ) -> StorageResult<()>;
     fn insert_session_bundle(&self, session: &AgentSession, run: &Run) -> StorageResult<()>;
     fn insert_run(&self, run: &Run) -> StorageResult<()>;
+    fn insert_channel(&self, channel: &Channel) -> StorageResult<()>;
     fn update_run_status(
         &self,
         run_id: RunId,
@@ -133,20 +134,6 @@ impl SqliteStore {
         connection.execute(
             "INSERT INTO workspaces (id, name, repository_path, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![workspace.id.to_string(), workspace.name, to_json!(&workspace.repository_path)?, workspace.created_at],
-        )?;
-        Ok(())
-    }
-
-    pub fn insert_channel(&self, channel: &Channel) -> StorageResult<()> {
-        let connection = self.connection()?;
-        connection.execute(
-            "INSERT INTO channels (id, workspace_id, name, position) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                channel.id.to_string(),
-                channel.workspace_id.to_string(),
-                channel.name,
-                channel.position
-            ],
         )?;
         Ok(())
     }
@@ -366,6 +353,23 @@ impl TomaStore for SqliteStore {
         Ok(())
     }
 
+    fn insert_channel(&self, channel: &Channel) -> StorageResult<()> {
+        self.connection()?.execute(
+            "INSERT INTO channels (id, workspace_id, name, position, repository_path) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                channel.id.to_string(),
+                channel.workspace_id.to_string(),
+                channel.name,
+                channel.position,
+                channel
+                    .repository_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned())
+            ],
+        )?;
+        Ok(())
+    }
+
     fn insert_run(&self, run: &Run) -> StorageResult<()> {
         let mut connection = self.connection()?;
         let tx = connection.transaction()?;
@@ -485,6 +489,12 @@ fn migrate(connection: &mut Connection) -> StorageResult<()> {
         tx.pragma_update(None, "user_version", 1)?;
         tx.commit()?;
     }
+    if version < 2 {
+        let tx = connection.transaction()?;
+        tx.execute_batch("ALTER TABLE channels ADD COLUMN repository_path TEXT")?;
+        tx.pragma_update(None, "user_version", 2)?;
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -548,13 +558,14 @@ macro_rules! query_entities {
 query_entities!(
     query_channels,
     Channel,
-    "SELECT c.id, c.workspace_id, c.name, c.position FROM channels c WHERE c.workspace_id = ?1 ORDER BY c.position, c.id",
+    "SELECT c.id, c.workspace_id, c.name, c.position, c.repository_path FROM channels c WHERE c.workspace_id = ?1 ORDER BY c.position, c.id",
     |row| -> rusqlite::Result<StorageResult<Channel>> {
         Ok(Ok(Channel {
             id: parse_id(&row.get::<_, String>(0)?)?,
             workspace_id: parse_id(&row.get::<_, String>(1)?)?,
             name: row.get(2)?,
             position: row.get(3)?,
+            repository_path: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
         }))
     }
 );

@@ -11,7 +11,10 @@ pub use view_model::{ContextKey, ShellViewModel};
 
 use std::sync::Arc;
 
-use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, px, size};
+use gpui::{
+    App, Application, Bounds, TitlebarOptions, WindowBackgroundAppearance, WindowBounds,
+    WindowOptions, point, px, size,
+};
 use toma_core::TomaCore;
 use toma_domain::*;
 use toma_storage::WorkspaceSnapshot;
@@ -29,11 +32,18 @@ pub fn run_with_snapshot(snapshot: WorkspaceSnapshot) {
 fn open(snapshot: WorkspaceSnapshot, backend: Option<(Arc<TomaCore>, WorkspaceId)>) {
     Application::new().run(move |cx: &mut App| {
         cx.set_global(Theme::for_appearance(cx.window_appearance()));
-        let bounds = Bounds::centered(None, size(px(1180.), px(760.)), cx);
+        let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(860.), px(560.))),
+                window_min_size: Some(size(px(900.), px(560.))),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Toma".into()),
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(18.), px(18.))),
+                }),
+                // Lets the translucent sidebar show the desktop through, like Finder or Mail.
+                window_background: WindowBackgroundAppearance::Blurred,
                 ..Default::default()
             },
             |window, cx| shell::TomaShell::new(snapshot, backend, window, cx),
@@ -69,10 +79,10 @@ fn sample_snapshot() -> WorkspaceSnapshot {
             created_at: 0,
         }),
         channels: vec![
-            Channel { id: general_id, workspace_id, name: "general".into(), position: 0 },
-            Channel { id: shipping_id, workspace_id, name: "shipping".into(), position: 1 },
-            Channel { id: ChannelId::new(), workspace_id, name: "research".into(), position: 2 },
-            Channel { id: ChannelId::new(), workspace_id, name: "design-review".into(), position: 3 },
+            Channel { id: general_id, workspace_id, name: "general".into(), position: 0, repository_path: None },
+            Channel { id: shipping_id, workspace_id, name: "shipping".into(), position: 1, repository_path: None },
+            Channel { id: ChannelId::new(), workspace_id, name: "research".into(), position: 2, repository_path: None },
+            Channel { id: ChannelId::new(), workspace_id, name: "design-review".into(), position: 3, repository_path: None },
         ],
         people: vec![Person { id: person_id, workspace_id, display_name: "Ahmed".into() }],
         agents: vec![

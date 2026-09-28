@@ -5600,6 +5600,7 @@ name = "toma-ui"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "libc",
  "pulldown-cmark",
  "toma-core",
  "toma-domain",

@@ -1,7 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
-    sync::{Arc, Mutex, MutexGuard},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use thiserror::Error;
@@ -39,6 +42,8 @@ impl Clock for SystemClock {
 #[derive(Default)]
 struct CoreState {
     snapshots: HashMap<WorkspaceId, WorkspaceSnapshot>,
+    /// The in-progress reply message of each streaming run; persisted once the run replies.
+    streaming: HashMap<RunId, MessageId>,
 }
 
 pub struct TomaCore {
@@ -47,6 +52,7 @@ pub struct TomaCore {
     pub runners: Vec<Arc<dyn AgentRunner>>,
     pub clock: Arc<dyn Clock>,
     state: Mutex<CoreState>,
+    revision: AtomicU64,
 }
 
 impl TomaCore {
@@ -62,7 +68,22 @@ impl TomaCore {
             runners,
             clock,
             state: Mutex::new(CoreState::default()),
+            revision: AtomicU64::new(0),
         }
+    }
+
+    /// Increases whenever cached state changes, so views can poll cheaply.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    /// The live state, including replies that are still streaming.
+    pub fn cached_snapshot(&self, workspace_id: WorkspaceId) -> Option<WorkspaceSnapshot> {
+        self.state().ok()?.snapshots.get(&workspace_id).cloned()
+    }
+
+    fn changed(&self) {
+        self.revision.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Loads durable state and makes it available to subsequent ID-based commands.
@@ -95,7 +116,17 @@ impl TomaCore {
     }
 
     pub fn dispatch(&self, command: AppCommand) -> Result<Vec<AppEvent>, CoreError> {
+        let result = self.dispatch_inner(command);
+        self.changed();
+        result
+    }
+
+    fn dispatch_inner(&self, command: AppCommand) -> Result<Vec<AppEvent>, CoreError> {
         match command {
+            AppCommand::CreateChannel {
+                workspace_id,
+                repository_path,
+            } => self.create_channel(workspace_id, repository_path),
             AppCommand::OpenWorkspace { repository_path } => self.open_workspace(&repository_path),
             AppCommand::SelectChannel { channel_id } => {
                 self.workspace_for_channel(channel_id)?;
@@ -209,6 +240,7 @@ impl TomaCore {
             snapshot.messages.push(message.clone());
             snapshot.attachments.extend(attachments);
         }
+        self.changed();
 
         let mut events = vec![AppEvent::MessagePosted {
             message_id: message.id,
@@ -507,8 +539,8 @@ impl TomaCore {
             (provider, session.provider_session_id.clone(), instructions)
         };
         let runner = self.runner(provider)?;
-        let worktree = match self.ensure_worktree(workspace_id, thread_id) {
-            Ok(worktree) => worktree,
+        let working_directory = match self.working_directory(workspace_id, thread_id) {
+            Ok(path) => path,
             Err(error) => {
                 self.fail_run(run_id, error.to_string(), events)?;
                 return Ok(());
@@ -534,20 +566,26 @@ impl TomaCore {
         } else {
             format!("{instructions}\n\n{prompt}")
         };
-        let mut emitted = Vec::new();
+        // Events are applied as they arrive so replies stream into the cached snapshot.
+        let mut sequence = 0;
+        let mut handled = Ok(());
         let result = runner.run(
             RunRequest {
                 run_id,
                 session_id,
                 provider_session_id: provider_session_id.as_deref(),
-                working_directory: &worktree.path,
+                working_directory: &working_directory,
                 prompt: &effective_prompt,
             },
-            &mut |event| emitted.push(event),
+            &mut |event| {
+                sequence += 1;
+                if handled.is_ok() {
+                    handled = self.handle_runner_event(run_id, sequence, event, events);
+                    self.changed();
+                }
+            },
         );
-        for (index, event) in emitted.into_iter().enumerate() {
-            self.handle_runner_event(run_id, index as i64 + 1, event, events)?;
-        }
+        handled?;
         if let Err(error) = result {
             self.fail_run(run_id, error.to_string(), events)?;
         }
@@ -562,6 +600,10 @@ impl TomaCore {
         events: &mut Vec<AppEvent>,
     ) -> Result<(), CoreError> {
         let now = self.clock.now_ms();
+        if let RunnerEvent::ReplyDelta(text) = &event {
+            // Deltas are derived from raw output lines, which are already in history.
+            return self.stream_reply(run_id, text, now);
+        }
         self.store
             .append_raw_history(run_id, sequence, &raw_payload(&event), now)?;
 
@@ -584,6 +626,7 @@ impl TomaCore {
                 let message_id = self.post_agent_reply(run_id, body, now)?;
                 events.push(AppEvent::MessagePosted { message_id });
             }
+            RunnerEvent::ReplyDelta(_) => unreachable!("handled above"),
             RunnerEvent::WaitingForInput(text) => {
                 self.ensure_run_started(run_id, events)?;
                 events.push(AppEvent::RunnerOutput { run_id, text });
@@ -678,6 +721,7 @@ impl TomaCore {
         &self,
         workspace_id: WorkspaceId,
         thread_id: ThreadId,
+        repository: Option<PathBuf>,
     ) -> Result<WorktreeRecord, CoreError> {
         let (workspace, existing) = {
             let state = self.state()?;
@@ -697,9 +741,10 @@ impl TomaCore {
             return Ok(existing);
         }
 
-        let root = workspace.repository_path.join(".toma").join("worktrees");
+        let repository = repository.unwrap_or(workspace.repository_path);
+        let root = repository.join(".toma").join("worktrees");
         let record = self.worktrees.ensure(WorktreeRequest {
-            repository_path: &workspace.repository_path,
+            repository_path: &repository,
             worktree_root: &root,
             thread_id,
             base_ref: "HEAD",
@@ -882,7 +927,37 @@ impl TomaCore {
         Err(CoreError::InvalidCommand("unknown or unloaded run".into()))
     }
 
-    /// Posts the agent's answer into the task thread the run belongs to.
+    /// Appends a streamed fragment to the run's in-progress reply, creating it on first text.
+    fn stream_reply(&self, run_id: RunId, text: &str, now: TimestampMs) -> Result<(), CoreError> {
+        let mut state = self.state()?;
+        let state = &mut *state;
+        if let Some(message_id) = state.streaming.get(&run_id) {
+            if let Some(message) = state
+                .snapshots
+                .values_mut()
+                .flat_map(|snapshot| snapshot.messages.iter_mut())
+                .find(|message| message.id == *message_id)
+            {
+                message.body.push_str(text);
+            }
+            return Ok(());
+        }
+        let text = text.trim_start();
+        if text.is_empty() {
+            return Ok(());
+        }
+        for snapshot in state.snapshots.values_mut() {
+            if let Some(message) = reply_message(snapshot, run_id, text.to_owned(), now)? {
+                state.streaming.insert(run_id, message.id);
+                snapshot.messages.push(message);
+                return Ok(());
+            }
+        }
+        Err(CoreError::InvalidCommand("unknown or unloaded run".into()))
+    }
+
+    /// Persists the agent's answer in its task thread. A streamed reply keeps the text the
+    /// user watched arrive, which also covers narration between tool calls.
     fn post_agent_reply(
         &self,
         run_id: RunId,
@@ -890,33 +965,93 @@ impl TomaCore {
         now: TimestampMs,
     ) -> Result<MessageId, CoreError> {
         let mut state = self.state()?;
-        for snapshot in state.snapshots.values_mut() {
-            let Some(session) = snapshot
-                .runs
-                .iter()
-                .find(|run| run.id == run_id)
-                .and_then(|run| snapshot.sessions.iter().find(|s| s.id == run.session_id))
-            else {
-                continue;
-            };
-            let thread = snapshot
-                .threads
-                .iter()
-                .find(|thread| thread.id == session.thread_id)
-                .ok_or_else(|| CoreError::InvalidCommand("session has no thread".into()))?;
-            let message = Message {
-                id: MessageId::new(),
-                channel_id: thread.channel_id,
-                thread_id: Some(thread.id),
-                author: MessageAuthor::Agent(session.agent_id),
-                body,
-                created_at: now,
-            };
+        if let Some(message_id) = state.streaming.remove(&run_id) {
+            let message = state
+                .snapshots
+                .values()
+                .flat_map(|snapshot| &snapshot.messages)
+                .find(|message| message.id == message_id)
+                .cloned()
+                .ok_or_else(|| CoreError::InvalidCommand("streamed reply vanished".into()))?;
             self.store.insert_message(&message, &[])?;
-            snapshot.messages.push(message.clone());
-            return Ok(message.id);
+            return Ok(message_id);
+        }
+        for snapshot in state.snapshots.values_mut() {
+            if let Some(message) = reply_message(snapshot, run_id, body.clone(), now)? {
+                self.store.insert_message(&message, &[])?;
+                snapshot.messages.push(message.clone());
+                return Ok(message.id);
+            }
         }
         Err(CoreError::InvalidCommand("unknown or unloaded run".into()))
+    }
+
+    fn create_channel(
+        &self,
+        workspace_id: WorkspaceId,
+        repository_path: PathBuf,
+    ) -> Result<Vec<AppEvent>, CoreError> {
+        let channel = {
+            let state = self.state()?;
+            let snapshot = state
+                .snapshots
+                .get(&workspace_id)
+                .ok_or_else(|| CoreError::InvalidCommand("unknown or unloaded workspace".into()))?;
+            let base = channel_name(&repository_path);
+            let name = (1..)
+                .map(|n| {
+                    if n == 1 {
+                        base.clone()
+                    } else {
+                        format!("{base}-{n}")
+                    }
+                })
+                .find(|name| snapshot.channels.iter().all(|c| &c.name != name))
+                .expect("unbounded");
+            Channel {
+                id: ChannelId::new(),
+                workspace_id,
+                name,
+                position: snapshot
+                    .channels
+                    .iter()
+                    .map(|c| c.position + 1)
+                    .max()
+                    .unwrap_or(0),
+                repository_path: Some(repository_path),
+            }
+        };
+        self.store.insert_channel(&channel)?;
+        let channel_id = channel.id;
+        self.state()?
+            .snapshots
+            .get_mut(&workspace_id)
+            .expect("validated")
+            .channels
+            .push(channel);
+        Ok(vec![AppEvent::ChannelCreated { channel_id }])
+    }
+
+    /// Git folders get an isolated worktree per thread; plain folders are used directly.
+    fn working_directory(
+        &self,
+        workspace_id: WorkspaceId,
+        thread_id: ThreadId,
+    ) -> Result<PathBuf, CoreError> {
+        let folder = {
+            let state = self.state()?;
+            let snapshot = state.snapshots.get(&workspace_id).expect("validated");
+            snapshot
+                .threads
+                .iter()
+                .find(|thread| thread.id == thread_id)
+                .and_then(|thread| snapshot.channels.iter().find(|c| c.id == thread.channel_id))
+                .and_then(|channel| channel.repository_path.clone())
+        };
+        match folder {
+            Some(folder) if !folder.join(".git").exists() => Ok(folder),
+            folder => Ok(self.ensure_worktree(workspace_id, thread_id, folder)?.path),
+        }
     }
 
     fn set_provider_session_id(
@@ -965,19 +1100,84 @@ fn unique_agent_targets(targets: &[AttachmentTarget]) -> Vec<AgentId> {
         .collect()
 }
 
+/// A short title from the first line of the request, without @mentions.
 fn thread_title(body: &str, agent_name: &str) -> String {
-    let title: String = body
+    const MAX: usize = 48;
+    let words: Vec<_> = body
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
         .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(80)
+        .filter(|word| !word.starts_with('@'))
         .collect();
-    if title.is_empty() {
-        format!("Task for {agent_name}")
-    } else {
-        title
+    let mut title = String::new();
+    for word in words {
+        if !title.is_empty() && title.chars().count() + 1 + word.chars().count() > MAX {
+            title.push('…');
+            break;
+        }
+        if !title.is_empty() {
+            title.push(' ');
+        }
+        title.push_str(word);
     }
+    let title = title.trim_end_matches(['.', ',', ':', ';']);
+    let mut chars = title.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => format!("Task for {agent_name}"),
+    }
+}
+
+fn channel_name(folder: &Path) -> String {
+    let name: String = folder
+        .file_name()
+        .map(|name| name.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if name.is_empty() {
+        "folder".into()
+    } else {
+        name
+    }
+}
+
+/// Builds the agent's reply message for `run_id` if the run belongs to `snapshot`.
+fn reply_message(
+    snapshot: &WorkspaceSnapshot,
+    run_id: RunId,
+    body: String,
+    now: TimestampMs,
+) -> Result<Option<Message>, CoreError> {
+    let Some(session) = snapshot
+        .runs
+        .iter()
+        .find(|run| run.id == run_id)
+        .and_then(|run| snapshot.sessions.iter().find(|s| s.id == run.session_id))
+    else {
+        return Ok(None);
+    };
+    let thread = snapshot
+        .threads
+        .iter()
+        .find(|thread| thread.id == session.thread_id)
+        .ok_or_else(|| CoreError::InvalidCommand("session has no thread".into()))?;
+    Ok(Some(Message {
+        id: MessageId::new(),
+        channel_id: thread.channel_id,
+        thread_id: Some(thread.id),
+        author: MessageAuthor::Agent(session.agent_id),
+        body,
+        created_at: now,
+    }))
 }
 
 fn raw_payload(event: &RunnerEvent) -> String {
@@ -987,6 +1187,7 @@ fn raw_payload(event: &RunnerEvent) -> String {
         } => format!("started:{}", provider_session_id.as_deref().unwrap_or("")),
         RunnerEvent::Output(text) => text.clone(),
         RunnerEvent::Reply(text) => format!("reply:{text}"),
+        RunnerEvent::ReplyDelta(text) => text.clone(),
         RunnerEvent::WaitingForInput(text) => format!("waiting_for_input:{text}"),
         RunnerEvent::Completed => "completed".into(),
         RunnerEvent::Failed(message) => format!("failed:{message}"),

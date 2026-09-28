@@ -32,6 +32,7 @@ impl ClaudeCodeRunner {
             OsString::from("--output-format"),
             OsString::from("stream-json"),
             OsString::from("--verbose"),
+            OsString::from("--include-partial-messages"),
             OsString::from("--permission-mode"),
             OsString::from("dontAsk"),
             OsString::from("--permission-prompts"),
@@ -53,6 +54,19 @@ fn claude_event(line: &serde_json::Value) -> Option<RunnerEvent> {
             provider_session_id: line["session_id"].as_str().map(str::to_owned),
         }),
         ("result", _) => Some(RunnerEvent::Reply(line["result"].as_str()?.to_owned())),
+        ("stream_event", _) => {
+            let event = &line["event"];
+            match event["type"].as_str()? {
+                "content_block_delta" if event["delta"]["type"] == "text_delta" => Some(
+                    RunnerEvent::ReplyDelta(event["delta"]["text"].as_str()?.to_owned()),
+                ),
+                // Separates text from successive turns (e.g. around tool calls).
+                "content_block_start" if event["content_block"]["type"] == "text" => {
+                    Some(RunnerEvent::ReplyDelta("\n\n".into()))
+                }
+                _ => None,
+            }
+        }
         _ => None,
     }
 }

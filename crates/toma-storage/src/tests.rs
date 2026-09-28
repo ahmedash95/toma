@@ -30,6 +30,7 @@ impl Fixture {
             workspace_id: workspace.id,
             name: "general".into(),
             position: 0,
+            repository_path: Some(repository_path.join("app")),
         };
         let person = Person {
             id: PersonId::new(),

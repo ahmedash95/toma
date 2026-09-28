@@ -55,6 +55,11 @@ impl TomaStore for FakeStore {
         Ok(())
     }
 
+    fn insert_channel(&self, channel: &Channel) -> StorageResult<()> {
+        self.snapshot.lock().unwrap().channels.push(channel.clone());
+        Ok(())
+    }
+
     fn insert_run(&self, run: &Run) -> StorageResult<()> {
         self.snapshot.lock().unwrap().runs.push(run.clone());
         Ok(())
@@ -254,6 +259,7 @@ fn fixture_with_events(emitted: Vec<RunnerEvent>) -> Fixture {
             workspace_id,
             name: "general".into(),
             position: 0,
+            repository_path: None,
         }],
         people: vec![Person {
             id: PersonId::new(),
@@ -636,4 +642,89 @@ fn agent_reply_becomes_a_thread_message_and_session_id_persists() {
         snapshot.sessions[0].provider_session_id.as_deref(),
         Some("provider-1")
     );
+}
+
+#[test]
+fn streamed_reply_grows_one_live_message_and_persists_on_completion() {
+    let fixture = fixture_with_events(vec![
+        RunnerEvent::ReplyDelta("\n\n".into()),
+        RunnerEvent::ReplyDelta("Hel".into()),
+        RunnerEvent::ReplyDelta("lo".into()),
+        RunnerEvent::Reply("Hello".into()),
+        RunnerEvent::Completed,
+    ]);
+    fixture
+        .core
+        .dispatch(AppCommand::PostMessage {
+            channel_id: fixture.channel_id,
+            thread_id: None,
+            body: "Greet".into(),
+            attachments: vec![AttachmentTarget::Agent {
+                agent_id: fixture.agent_id,
+            }],
+        })
+        .unwrap();
+
+    let live = fixture.core.cached_snapshot(fixture.workspace_id).unwrap();
+    let stored = fixture.store.snapshot.lock().unwrap();
+    for snapshot in [&live, &*stored] {
+        let replies: Vec<_> = snapshot
+            .messages
+            .iter()
+            .filter(|m| m.author == MessageAuthor::Agent(fixture.agent_id))
+            .collect();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].body, "Hello");
+    }
+    assert!(fixture.core.revision() > 0);
+}
+
+#[test]
+fn thread_titles_are_short_and_drop_mentions() {
+    assert_eq!(
+        thread_title("@Claude what model are you running?\nmore", "Claude"),
+        "What model are you running?"
+    );
+    assert_eq!(
+        thread_title(
+            "please refactor the storage layer so that migrations run inside one transaction",
+            "Claude"
+        ),
+        "Please refactor the storage layer so that…"
+    );
+    assert_eq!(thread_title("@Claude", "Claude"), "Task for Claude");
+}
+
+#[test]
+fn channels_take_their_folder_name_and_plain_folders_skip_worktrees() {
+    let fixture = fixture();
+    let folder = tempfile::TempDir::new().unwrap();
+    let path = folder.path().join("My App");
+    std::fs::create_dir(&path).unwrap();
+    for _ in 0..2 {
+        fixture
+            .core
+            .dispatch(AppCommand::CreateChannel {
+                workspace_id: fixture.workspace_id,
+                repository_path: path.clone(),
+            })
+            .unwrap();
+    }
+    let snapshot = fixture.core.cached_snapshot(fixture.workspace_id).unwrap();
+    let names: Vec<_> = snapshot.channels.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["general", "my-app", "my-app-2"]);
+
+    fixture
+        .core
+        .dispatch(AppCommand::PostMessage {
+            channel_id: snapshot.channels[1].id,
+            thread_id: None,
+            body: "Look around".into(),
+            attachments: vec![AttachmentTarget::Agent {
+                agent_id: fixture.agent_id,
+            }],
+        })
+        .unwrap();
+    assert_eq!(fixture.runner.requests.lock().unwrap()[0].2, path);
+    assert!(fixture.worktrees.ensured.lock().unwrap().is_empty());
 }

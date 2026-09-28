@@ -6,6 +6,9 @@ pub enum AppEvent {
     WorkspaceOpened {
         workspace_id: WorkspaceId,
     },
+    ChannelCreated {
+        channel_id: ChannelId,
+    },
     ChannelSelected {
         channel_id: ChannelId,
     },

@@ -63,15 +63,47 @@ impl ShellViewModel {
     }
 
     pub fn draft(&self) -> &str {
-        self.context()
-            .and_then(|key| self.drafts.get(&key).map(String::as_str))
-            .unwrap_or("")
+        self.context().map_or("", |key| self.draft_for(key))
     }
 
     pub fn set_draft(&mut self, body: impl Into<String>) {
         if let Some(key) = self.context() {
-            self.drafts.insert(key, body.into());
+            self.set_draft_for(key, body);
         }
+    }
+
+    pub fn draft_for(&self, key: ContextKey) -> &str {
+        self.drafts.get(&key).map_or("", String::as_str)
+    }
+
+    pub fn set_draft_for(&mut self, key: ContextKey, body: impl Into<String>) {
+        self.drafts.insert(key, body.into());
+    }
+
+    /// Threads for the sidebar, most recently active first.
+    pub fn recent_threads(&self) -> Vec<&TaskThread> {
+        let mut threads: Vec<_> = self.snapshot.threads.iter().collect();
+        threads.sort_by_key(|thread| std::cmp::Reverse(thread.updated_at));
+        threads
+    }
+
+    /// Names of agents with a run still in progress in `thread_id`.
+    pub fn working_agents(&self, thread_id: ThreadId) -> Vec<&str> {
+        self.snapshot
+            .sessions
+            .iter()
+            .filter(|session| session.thread_id == thread_id)
+            .filter(|session| {
+                self.snapshot.runs.iter().any(|run| {
+                    run.session_id == session.id
+                        && matches!(
+                            run.status,
+                            WorkStatus::Queued | WorkStatus::Reading | WorkStatus::Working
+                        )
+                })
+            })
+            .map(|session| self.author_name(MessageAuthor::Agent(session.agent_id)))
+            .collect()
     }
 
     pub fn select_channel(&mut self, channel_id: ChannelId) {
@@ -136,26 +168,6 @@ impl ShellViewModel {
             MessageAuthor::System => "Toma",
         }
     }
-
-    pub fn active_runs(&self) -> Vec<(&AgentDefinition, &Run)> {
-        self.snapshot
-            .runs
-            .iter()
-            .filter_map(|run| {
-                let session = self
-                    .snapshot
-                    .sessions
-                    .iter()
-                    .find(|session| session.id == run.session_id)?;
-                let agent = self
-                    .snapshot
-                    .agents
-                    .iter()
-                    .find(|agent| agent.id == session.agent_id)?;
-                Some((agent, run))
-            })
-            .collect()
-    }
 }
 
 #[cfg(test)]
@@ -175,12 +187,14 @@ mod tests {
                         workspace_id,
                         name: "second".into(),
                         position: 2,
+                        repository_path: None,
                     },
                     Channel {
                         id: first,
                         workspace_id,
                         name: "first".into(),
                         position: 1,
+                        repository_path: None,
                     },
                 ],
                 threads: vec![TaskThread {

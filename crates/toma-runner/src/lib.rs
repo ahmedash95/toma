@@ -40,6 +40,8 @@ pub enum RunnerEvent {
     Output(String),
     /// The agent's user-facing answer, extracted from the provider's raw output.
     Reply(String),
+    /// A streamed fragment of the reply, ahead of the final `Reply`.
+    ReplyDelta(String),
     WaitingForInput(String),
     Completed,
     Failed(String),
