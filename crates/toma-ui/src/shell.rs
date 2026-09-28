@@ -734,6 +734,7 @@ impl TomaShell {
         let reply_count = replies.len();
         let working = self.model.working_agents(thread_id);
         let stats = self.model.thread_stats(thread_id);
+        let mode = thread.permission_mode;
         let requests: Vec<_> = self
             .model
             .snapshot
@@ -786,18 +787,25 @@ impl TomaShell {
                                         .truncate()
                                         .child(thread.title),
                                 )
+                                // One line that clips at the pane edge instead of wrapping
+                                // into the title.
                                 .child(
                                     div()
                                         .flex()
                                         .items_center()
                                         .gap_2()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
                                         .text_size(px(11.))
                                         .text_color(theme.text_secondary)
-                                        .child(status_label(thread.status))
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .child(status_label(thread.status)),
+                                        )
                                         .children(stats_row(stats, theme)),
                                 ),
                         )
-                        .child(self.mode_picker(thread.id, thread.permission_mode, theme, cx))
                         .child(
                             div()
                                 .id("close-thread")
@@ -855,7 +863,26 @@ impl TomaShell {
                         .px_4()
                         .pb_4()
                         .pt_1()
-                        .child(self.thread_composer.clone()),
+                        .child(self.thread_composer.clone())
+                        // The mode sits with the input, like Codex and Claude: it governs
+                        // what the next message is allowed to do.
+                        .child(
+                            div()
+                                .mt_2()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .child(self.mode_picker(thread_id, mode, theme, cx))
+                                .child(
+                                    div()
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .text_size(px(11.))
+                                        .text_color(theme.text_tertiary)
+                                        .child("⏎ send · ⇧⏎ new line"),
+                                ),
+                        ),
                 )
                 // Drag handle over the divider; the root follows the drag.
                 .child(
