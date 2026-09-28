@@ -45,6 +45,14 @@ pub enum RunnerEvent {
     /// A streamed fragment of the reply, ahead of the final `Reply`.
     ReplyDelta(String),
     WaitingForInput(String),
+    /// Totals the provider reports when a run ends.
+    Usage {
+        input_tokens: i64,
+        output_tokens: i64,
+        cached_tokens: i64,
+        cost_micros: Option<i64>,
+        duration_ms: Option<i64>,
+    },
     /// The agent is blocked until the person allows or denies `tool`.
     PermissionRequest {
         request_id: String,
@@ -92,14 +100,14 @@ pub trait AgentRunner: Send + Sync {
 pub(crate) fn translate(
     event: RunnerEvent,
     emit: &mut dyn FnMut(RunnerEvent),
-    parse: fn(&serde_json::Value) -> Option<RunnerEvent>,
+    parse: fn(&serde_json::Value) -> Vec<RunnerEvent>,
 ) {
     let derived = match &event {
-        RunnerEvent::Output(line) => serde_json::from_str(line).ok().and_then(|v| parse(&v)),
-        _ => None,
+        RunnerEvent::Output(line) => serde_json::from_str(line)
+            .map(|value| parse(&value))
+            .unwrap_or_default(),
+        _ => Vec::new(),
     };
     emit(event);
-    if let Some(derived) = derived {
-        emit(derived);
-    }
+    derived.into_iter().for_each(emit);
 }

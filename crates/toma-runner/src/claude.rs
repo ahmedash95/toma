@@ -95,12 +95,36 @@ impl ClaudeCodeRunner {
 }
 
 /// Maps a `--output-format stream-json` line to the events it implies.
+fn claude_events(line: &serde_json::Value) -> Vec<RunnerEvent> {
+    if line["type"] != "result" {
+        return claude_event(line).into_iter().collect();
+    }
+    let usage = &line["usage"];
+    let tokens = |key: &str| usage[key].as_i64().unwrap_or(0);
+    let mut events: Vec<_> = line["result"]
+        .as_str()
+        .map(|text| RunnerEvent::Reply(text.to_owned()))
+        .into_iter()
+        .collect();
+    events.push(RunnerEvent::Usage {
+        input_tokens: tokens("input_tokens")
+            + tokens("cache_creation_input_tokens")
+            + tokens("cache_read_input_tokens"),
+        output_tokens: tokens("output_tokens"),
+        cached_tokens: tokens("cache_read_input_tokens"),
+        cost_micros: line["total_cost_usd"]
+            .as_f64()
+            .map(|usd| (usd * 1_000_000.0).round() as i64),
+        duration_ms: line["duration_ms"].as_i64(),
+    });
+    events
+}
+
 fn claude_event(line: &serde_json::Value) -> Option<RunnerEvent> {
     match (line["type"].as_str()?, line["subtype"].as_str()) {
         ("system", Some("init")) => Some(RunnerEvent::Started {
             provider_session_id: line["session_id"].as_str().map(str::to_owned),
         }),
-        ("result", _) => Some(RunnerEvent::Reply(line["result"].as_str()?.to_owned())),
         ("stream_event", _) => {
             let event = &line["event"];
             match event["type"].as_str()? {
@@ -160,7 +184,7 @@ impl AgentRunner for ClaudeCodeRunner {
         let mut command = self.command(&request, listener.as_ref().map(|l| l.socket.as_path()));
         command.events = events;
         self.process.run(request, command, &mut |event| {
-            translate(event, emit, claude_event)
+            translate(event, emit, claude_events)
         })
     }
 

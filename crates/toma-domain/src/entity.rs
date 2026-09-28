@@ -32,6 +32,7 @@ pub struct Person {
 pub enum RunnerProvider {
     CodexCli,
     ClaudeCodeCli,
+    CursorCli,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -160,4 +161,17 @@ pub struct PermissionRequest {
     pub agent_id: AgentId,
     pub tool: String,
     pub detail: String,
+}
+
+/// What a run consumed, as reported by the provider at the end of the run.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RunUsage {
+    pub run_id: RunId,
+    /// All prompt tokens, including cache reads and writes.
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cached_tokens: i64,
+    /// Millionths of a US dollar, when the provider reports cost.
+    pub cost_micros: Option<i64>,
+    pub duration_ms: Option<i64>,
 }

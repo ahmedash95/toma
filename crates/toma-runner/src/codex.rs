@@ -87,7 +87,7 @@ impl AgentRunner for CodexCliRunner {
     ) -> Result<(), RunnerError> {
         let command = Self::command(&request);
         self.process.run(request, command, &mut |event| {
-            translate(event, emit, codex_event)
+            translate(event, emit, |line| codex_event(line).into_iter().collect())
         })
     }
 
