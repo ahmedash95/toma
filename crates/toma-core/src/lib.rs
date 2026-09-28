@@ -152,8 +152,12 @@ impl TomaCore {
             AppCommand::AnswerPermission {
                 run_id,
                 request_id,
-                allow,
-            } => self.answer_permission(run_id, &request_id, allow),
+                decision,
+            } => self.answer_permission(run_id, &request_id, decision),
+            AppCommand::SetPermissionMode { thread_id, mode } => {
+                self.set_permission_mode(thread_id, mode)?;
+                Ok(Vec::new())
+            }
         }
     }
 
@@ -478,6 +482,7 @@ impl TomaCore {
             status: WorkStatus::Queued,
             created_at: now,
             updated_at: now,
+            permission_mode: PermissionMode::Ask,
         };
         let session = AgentSession {
             id: SessionId::new(),
@@ -578,10 +583,19 @@ impl TomaCore {
             return Ok(());
         }
 
-        let effective_prompt = {
+        let (effective_prompt, permission_mode) = {
             let state = self.state()?;
             let snapshot = state.snapshots.get(&workspace_id).expect("validated");
-            compose_prompt(snapshot, thread_id, session_id, run_id, prompt)
+            let mode = snapshot
+                .threads
+                .iter()
+                .find(|thread| thread.id == thread_id)
+                .map(|thread| thread.permission_mode)
+                .unwrap_or_default();
+            (
+                compose_prompt(snapshot, thread_id, session_id, run_id, prompt),
+                mode,
+            )
         };
         // Events are applied as they arrive so replies stream into the cached snapshot.
         let mut sequence = 0;
@@ -593,6 +607,7 @@ impl TomaCore {
                 provider_session_id: provider_session_id.as_deref(),
                 working_directory: &working_directory,
                 prompt: &effective_prompt,
+                permission_mode,
             },
             &mut |event| {
                 sequence += 1;
@@ -714,6 +729,7 @@ impl TomaCore {
                 request_id,
                 tool,
                 detail,
+                rule,
             } => {
                 self.ensure_run_started(run_id, events)?;
                 {
@@ -731,6 +747,7 @@ impl TomaCore {
                         agent_id,
                         tool,
                         detail,
+                        rule,
                     });
                 }
                 self.transition_run(run_id, WorkStatus::WaitingForInput, events)?;
@@ -818,7 +835,7 @@ impl TomaCore {
         &self,
         run_id: RunId,
         request_id: &str,
-        allow: bool,
+        decision: PermissionDecision,
     ) -> Result<Vec<AppEvent>, CoreError> {
         let (provider, _) = self.run_provider_and_status(run_id)?;
         let request = {
@@ -833,7 +850,11 @@ impl TomaCore {
         }
         .ok_or_else(|| CoreError::InvalidCommand("no such pending permission request".into()))?;
         self.runner(provider)?
-            .answer_permission(run_id, request_id, allow)?;
+            .answer_permission(run_id, request_id, decision)?;
+        if decision == PermissionDecision::SwitchToAuto {
+            // Later runs in the thread start in Auto too, not just this session.
+            self.set_permission_mode(request.thread_id, PermissionMode::Auto)?;
+        }
 
         let mut events = Vec::new();
         let still_waiting = self.state()?.snapshots.values().any(|snapshot| {
@@ -856,17 +877,24 @@ impl TomaCore {
                 .expect("validated")
                 .channel_id
         };
+        let detail = request.detail.replace('`', "'");
         let message = Message {
             id: MessageId::new(),
             channel_id,
             thread_id: Some(request.thread_id),
             author: MessageAuthor::System,
-            body: format!(
-                "{} **{}**: `{}`",
-                if allow { "Allowed" } else { "Denied" },
-                request.tool,
-                request.detail.replace('`', "'")
-            ),
+            body: match decision {
+                PermissionDecision::Deny => format!("🚫 Denied **{}**: `{detail}`", request.tool),
+                PermissionDecision::Allow => format!("✅ Allowed **{}**: `{detail}`", request.tool),
+                PermissionDecision::AlwaysAllow => format!(
+                    "✅ Always allowed `{}` for this session: `{detail}`",
+                    request.rule
+                ),
+                PermissionDecision::SwitchToAuto => format!(
+                    "✅ Allowed **{}**: `{detail}`. This thread is now in ⚡ Auto mode.",
+                    request.tool
+                ),
+            },
             created_at: self.clock.now_ms(),
         };
         self.store.insert_message(&message, &[])?;
@@ -880,6 +908,24 @@ impl TomaCore {
             message_id: message.id,
         });
         Ok(events)
+    }
+
+    fn set_permission_mode(
+        &self,
+        thread_id: ThreadId,
+        mode: PermissionMode,
+    ) -> Result<(), CoreError> {
+        let workspace_id = self.workspace_for_thread(thread_id)?;
+        self.store.set_permission_mode(thread_id, mode)?;
+        if let Some(thread) = self
+            .state()?
+            .snapshots
+            .get_mut(&workspace_id)
+            .and_then(|snapshot| snapshot.threads.iter_mut().find(|t| t.id == thread_id))
+        {
+            thread.permission_mode = mode;
+        }
+        Ok(())
     }
 
     fn cancel_run(&self, run_id: RunId) -> Result<Vec<AppEvent>, CoreError> {

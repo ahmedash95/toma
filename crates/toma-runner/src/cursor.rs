@@ -2,7 +2,7 @@ use crate::process::{CommandSpec, ProcessRunner};
 use crate::{AgentRunner, RunRequest, RunnerCapabilities, RunnerError, RunnerEvent, translate};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use toma_domain::{RunId, RunnerProvider};
+use toma_domain::{PermissionMode, RunId, RunnerProvider};
 
 #[derive(Clone)]
 pub struct CursorCliRunner {
@@ -42,6 +42,10 @@ impl CursorCliRunner {
         ]
         .map(OsString::from)
         .into();
+        // Cursor has no automatic reviewer, so Auto behaves like Ask (sandboxed commands).
+        if request.permission_mode == PermissionMode::Plan {
+            arguments.extend(["--mode".into(), "plan".into()]);
+        }
         if let Some(session_id) = request.provider_session_id {
             arguments.push("--resume".into());
             arguments.push(session_id.into());

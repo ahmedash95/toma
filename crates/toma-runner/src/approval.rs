@@ -14,12 +14,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
-use toma_domain::RunId;
+use toma_domain::{PermissionDecision, RunId};
 
 pub(crate) const TOOL: &str = "approve";
 
 /// Answers awaited by pending permission prompts, keyed by request id.
-pub(crate) type Pending = Arc<Mutex<HashMap<String, mpsc::Sender<bool>>>>;
+pub(crate) type Pending = Arc<Mutex<HashMap<String, mpsc::Sender<PermissionDecision>>>>;
 
 /// Serves one run's permission prompts until dropped.
 pub(crate) struct ApprovalListener {
@@ -92,26 +92,68 @@ fn serve(
         .lock()
         .map_err(|_| io::Error::other("approval lock poisoned"))?
         .insert(request_id.to_owned(), answer);
+    let (label, rule) = rule(&tool, &input);
     let _ = events.send(RunnerEvent::PermissionRequest {
         request_id: request_id.to_owned(),
         detail: summarize(&tool, &input),
         tool,
+        rule: label,
     });
     // Waits for the person; a stopped run (cancelled or exited) denies.
-    let allow = loop {
+    let answer = loop {
         match decision.recv_timeout(Duration::from_millis(100)) {
-            Ok(allow) => break allow,
+            Ok(answer) => break answer,
             Err(mpsc::RecvTimeoutError::Timeout) if !stop.load(Ordering::Acquire) => {}
-            Err(_) => break false,
+            Err(_) => break PermissionDecision::Deny,
         }
     };
-    let reply = if allow {
-        json!({ "behavior": "allow", "updatedInput": input })
-    } else {
-        json!({ "behavior": "deny", "message": "The user denied this action in Toma." })
-    };
+    let reply = reply(answer, input, rule);
     let mut stream = stream;
     writeln!(stream, "{reply}")
+}
+
+/// Claude's permission-result JSON. "Always" and "auto" use its own `updatedPermissions`
+/// protocol, so Claude remembers them for the rest of the session.
+fn reply(decision: PermissionDecision, input: Value, rule: Value) -> Value {
+    let allow = |updates: Value| json!({ "behavior": "allow", "updatedInput": input, "updatedPermissions": updates });
+    match decision {
+        PermissionDecision::Deny => {
+            json!({ "behavior": "deny", "message": "The user denied this action in Toma." })
+        }
+        PermissionDecision::Allow => json!({ "behavior": "allow", "updatedInput": input }),
+        PermissionDecision::AlwaysAllow => allow(json!([{
+            "type": "addRules",
+            "rules": [rule],
+            "behavior": "allow",
+            "destination": "session",
+        }])),
+        PermissionDecision::SwitchToAuto => allow(json!([{
+            "type": "setMode",
+            "mode": "auto",
+            "destination": "session",
+        }])),
+    }
+}
+
+/// The permission rule "Always allow" adds: a command prefix for Bash (`git push:*`),
+/// otherwise the whole tool. Returns a label for people and the rule for Claude.
+pub(crate) fn rule(tool: &str, input: &Value) -> (String, Value) {
+    let Some(command) = input["command"].as_str().filter(|_| tool == "Bash") else {
+        return (tool.to_owned(), json!({ "toolName": tool }));
+    };
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let prefix = match words.as_slice() {
+        [program, sub, ..]
+            if sub.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                && !sub.starts_with('-') =>
+        {
+            format!("{program} {sub}")
+        }
+        [program, ..] => (*program).to_owned(),
+        [] => String::new(),
+    };
+    let rule = json!({ "toolName": "Bash", "ruleContent": format!("{prefix}:*") });
+    (prefix, rule)
 }
 
 /// A one-line description of what the tool is about to do.
@@ -244,14 +286,34 @@ mod tests {
             request_id,
             tool,
             detail,
+            rule,
         } = received.recv_timeout(Duration::from_secs(5)).unwrap()
         else {
             panic!("expected a permission request");
         };
         assert_eq!((tool.as_str(), detail.as_str()), ("Bash", "git push"));
-        pending.lock().unwrap()[&request_id].send(true).unwrap();
+        assert_eq!(rule, "git push");
+        pending.lock().unwrap()[&request_id]
+            .send(PermissionDecision::AlwaysAllow)
+            .unwrap();
         let answer = asker.join().unwrap();
         assert_eq!(answer["behavior"], "allow");
         assert_eq!(answer["updatedInput"]["command"], "git push");
+        assert_eq!(answer["updatedPermissions"][0]["type"], "addRules");
+        assert_eq!(
+            answer["updatedPermissions"][0]["rules"][0]["ruleContent"],
+            "git push:*"
+        );
+    }
+
+    #[test]
+    fn rules_cover_a_command_prefix_or_a_whole_tool() {
+        let bash = |command: &str| rule("Bash", &json!({ "command": command })).0;
+        assert_eq!(bash("mkdir -p build/out"), "mkdir");
+        assert_eq!(bash("git push origin main"), "git push");
+        assert_eq!(bash("npm run test"), "npm run");
+        assert_eq!(rule("Write", &json!({ "file_path": "/a" })).0, "Write");
+        let auto = reply(PermissionDecision::SwitchToAuto, json!({}), json!({}));
+        assert_eq!(auto["updatedPermissions"][0]["mode"], "auto");
     }
 }

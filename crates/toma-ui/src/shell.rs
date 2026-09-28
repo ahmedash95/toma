@@ -36,8 +36,8 @@ pub struct TomaShell {
     resizing_thread: bool,
     /// Focus to move to on the next frame, once the target element exists.
     pending_focus: Option<FocusHandle>,
-    /// (Deny, Allow) buttons of each pending permission request.
-    request_buttons: HashMap<String, (FocusHandle, FocusHandle)>,
+    /// Deny, Allow, Always allow, Switch to Auto buttons of each pending permission request.
+    request_buttons: HashMap<String, [FocusHandle; 4]>,
     /// Requests that already took focus once, so they don't grab it again.
     focused_requests: HashSet<String>,
     _subscriptions: Vec<Subscription>,
@@ -215,13 +215,18 @@ impl TomaShell {
         });
     }
 
-    fn answer_permission(&mut self, request: &PermissionRequest, allow: bool, cx: &mut App) {
+    fn answer_permission(
+        &mut self,
+        request: &PermissionRequest,
+        decision: PermissionDecision,
+        cx: &mut App,
+    ) {
         // The card is about to disappear; hand focus back to where the person replies.
         self.pending_focus = Some(self.thread_composer.focus_handle(cx));
         self.dispatch_in_background(AppCommand::AnswerPermission {
             run_id: request.run_id,
             request_id: request.id.clone(),
-            allow,
+            decision,
         });
     }
 
@@ -350,15 +355,9 @@ impl TomaShell {
                 .thread_key()
                 .is_some_and(|key| !self.model.draft_for(key).is_empty());
         for id in visible {
-            let (_, allow) = self
-                .request_buttons
-                .entry(id.clone())
-                .or_insert_with(|| {
-                    (
-                        cx.focus_handle().tab_stop(true).tab_index(1),
-                        cx.focus_handle().tab_stop(true).tab_index(2),
-                    )
-                })
+            let allow = self.request_buttons.entry(id.clone()).or_insert_with(|| {
+                [1, 2, 3, 4].map(|index| cx.focus_handle().tab_stop(true).tab_index(index))
+            })[1]
                 .clone();
             if !typing && self.focused_requests.insert(id) {
                 self.pending_focus = Some(allow);
@@ -796,6 +795,7 @@ impl TomaShell {
                                         .children(stats_row(stats, theme)),
                                 ),
                         )
+                        .child(self.mode_picker(thread.id, thread.permission_mode, theme, cx))
                         .child(
                             div()
                                 .id("close-thread")
@@ -877,10 +877,73 @@ impl TomaShell {
         )
     }
 
+    /// Ask / Auto / Plan for the thread; each provider maps it to its own native mode.
+    fn mode_picker(
+        &self,
+        thread_id: ThreadId,
+        current: PermissionMode,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let modes = [
+            (
+                PermissionMode::Ask,
+                "✋",
+                "Ask before commands and edits outside the folder",
+            ),
+            (
+                PermissionMode::Auto,
+                "⚡",
+                "The agent's own reviewer answers for you",
+            ),
+            (
+                PermissionMode::Plan,
+                "📋",
+                "Read-only: plan and explain, no edits",
+            ),
+        ];
+        div()
+            .flex_shrink_0()
+            .flex()
+            .p(px(2.))
+            .gap(px(2.))
+            .rounded(px(7.))
+            .bg(theme.selection)
+            .children(modes.into_iter().map(|(mode, emoji, tip)| {
+                let selected = mode == current;
+                let label = format!("{mode:?}");
+                div()
+                    .id(SharedString::from(format!("mode-{label}")))
+                    .px_2()
+                    .py(px(1.))
+                    .rounded(px(5.))
+                    .text_size(px(11.))
+                    .cursor_pointer()
+                    .when(selected, |chip| {
+                        chip.bg(theme.content_bg)
+                            .shadow_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                    })
+                    .when(!selected, |chip| {
+                        chip.text_color(theme.text_secondary)
+                            .hover(|chip| chip.text_color(theme.text))
+                    })
+                    .tooltip(move |_window, cx| cx.new(|_| Tooltip(tip.into())).into())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.dispatch_in_background(AppCommand::SetPermissionMode {
+                            thread_id,
+                            mode,
+                        });
+                        cx.notify();
+                    }))
+                    .child(format!("{emoji} {label}"))
+            }))
+    }
+
     fn permission_card(
         &self,
         request: PermissionRequest,
-        (deny_focus, allow_focus): (FocusHandle, FocusHandle),
+        [deny_focus, allow_focus, always_focus, auto_focus]: [FocusHandle; 4],
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -889,17 +952,17 @@ impl TomaShell {
             .author_name(MessageAuthor::Agent(request.agent_id))
             .to_owned();
         let entity = cx.entity();
-        let answer = |allow: bool| -> OnPress {
+        let answer = |decision: PermissionDecision| -> OnPress {
             let entity = entity.clone();
             let request = request.clone();
             Rc::new(move |_, cx| {
                 entity.update(cx, |shell, cx| {
-                    shell.answer_permission(&request, allow, cx);
+                    shell.answer_permission(&request, decision, cx);
                     cx.notify();
                 })
             })
         };
-        let deny = answer(false);
+        let deny = answer(PermissionDecision::Deny);
         let escape = Rc::clone(&deny);
         div()
             .key_context("Dialog")
@@ -937,16 +1000,10 @@ impl TomaShell {
                 div()
                     .mt_3()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_end()
                     .gap_2()
-                    .child(
-                        div()
-                            .flex_grow()
-                            .text_size(px(11.))
-                            .text_color(theme.text_tertiary)
-                            .child("⏎ choose · ⇥ switch · esc deny"),
-                    )
                     .child(button(
                         SharedString::from(format!("deny-{}", request.id)),
                         "Deny",
@@ -957,12 +1014,35 @@ impl TomaShell {
                     ))
                     .child(button(
                         SharedString::from(format!("allow-{}", request.id)),
-                        "Allow",
+                        "Allow once",
                         &allow_focus,
                         ButtonStyle::Primary,
                         theme,
-                        answer(true),
+                        answer(PermissionDecision::Allow),
+                    ))
+                    .child(button(
+                        SharedString::from(format!("always-{}", request.id)),
+                        format!("Always allow {}", request.rule),
+                        &always_focus,
+                        ButtonStyle::Secondary,
+                        theme,
+                        answer(PermissionDecision::AlwaysAllow),
+                    ))
+                    .child(button(
+                        SharedString::from(format!("auto-{}", request.id)),
+                        "⚡ Allow & switch to Auto",
+                        &auto_focus,
+                        ButtonStyle::Secondary,
+                        theme,
+                        answer(PermissionDecision::SwitchToAuto),
                     )),
+            )
+            .child(
+                div()
+                    .mt_2()
+                    .text_size(px(11.))
+                    .text_color(theme.text_tertiary)
+                    .child("⏎ choose · ⇥ next · esc deny"),
             )
     }
 

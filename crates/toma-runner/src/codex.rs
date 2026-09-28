@@ -2,7 +2,7 @@ use crate::process::{CommandSpec, ProcessRunner};
 use crate::{AgentRunner, RunRequest, RunnerCapabilities, RunnerError, RunnerEvent, translate};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use toma_domain::{RunId, RunnerProvider};
+use toma_domain::{PermissionMode, RunId, RunnerProvider};
 
 #[derive(Clone)]
 pub struct CodexCliRunner {
@@ -28,6 +28,16 @@ impl CodexCliRunner {
 
     fn command(request: &RunRequest<'_>) -> CommandSpec {
         let mut arguments = vec![OsString::from("exec")];
+        // Codex's own modes: sandboxed writes, its automatic reviewer, or read-only.
+        arguments.extend(
+            match request.permission_mode {
+                PermissionMode::Ask => &["--sandbox", "workspace-write"][..],
+                PermissionMode::Auto => &["--approve-for-me"],
+                PermissionMode::Plan => &["--sandbox", "read-only"],
+            }
+            .iter()
+            .map(OsString::from),
+        );
         if let Some(session_id) = request.provider_session_id {
             arguments.push(OsString::from("resume"));
             arguments.push(OsString::from("--json"));

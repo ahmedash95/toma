@@ -70,6 +70,7 @@ impl Fixture {
             status: WorkStatus::Queued,
             created_at: 120,
             updated_at: 120,
+            permission_mode: PermissionMode::Ask,
         };
         let session = AgentSession {
             id: SessionId::new(),

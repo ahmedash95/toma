@@ -37,6 +37,10 @@ pub enum AppCommand {
     AnswerPermission {
         run_id: RunId,
         request_id: String,
-        allow: bool,
+        decision: PermissionDecision,
+    },
+    SetPermissionMode {
+        thread_id: ThreadId,
+        mode: PermissionMode,
     },
 }

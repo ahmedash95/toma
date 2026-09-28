@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use toma_domain::{RunId, RunnerProvider, SessionId};
+use toma_domain::{PermissionMode, RunId, RunnerProvider, SessionId};
 use toma_runner::{
     AgentRunner, ClaudeCodeRunner, CodexCliRunner, RunRequest, RunnerError, RunnerEvent,
 };
@@ -58,6 +58,7 @@ fn request(run_id: RunId, directory: &Path) -> RunRequest<'_> {
         provider_session_id: None,
         working_directory: directory,
         prompt: "do the work",
+        permission_mode: PermissionMode::Ask,
     }
 }
 
@@ -141,7 +142,7 @@ fn codex_keeps_its_command_shape_provider_specific() {
     assert_eq!(runner.provider(), RunnerProvider::CodexCli);
     assert_eq!(
         fs::read_to_string(arguments).unwrap(),
-        "exec\n--json\ndo the work\n"
+        "exec\n--sandbox\nworkspace-write\n--json\ndo the work\n"
     );
 }
 

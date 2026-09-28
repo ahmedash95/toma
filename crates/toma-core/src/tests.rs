@@ -123,6 +123,20 @@ impl TomaStore for FakeStore {
         Ok(())
     }
 
+    fn set_permission_mode(&self, thread_id: ThreadId, mode: PermissionMode) -> StorageResult<()> {
+        if let Some(thread) = self
+            .snapshot
+            .lock()
+            .unwrap()
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == thread_id)
+        {
+            thread.permission_mode = mode;
+        }
+        Ok(())
+    }
+
     fn save_run_usage(&self, usage: &RunUsage) -> StorageResult<()> {
         self.snapshot.lock().unwrap().usages.push(usage.clone());
         Ok(())
@@ -141,8 +155,9 @@ impl TomaStore for FakeStore {
 struct FakeRunner {
     emitted: Vec<RunnerEvent>,
     requests: Mutex<Vec<(RunId, SessionId, PathBuf, String)>>,
+    modes: Mutex<Vec<PermissionMode>>,
     cancelled: Mutex<Vec<RunId>>,
-    answers: Mutex<Vec<(String, bool)>>,
+    answers: Mutex<Vec<(String, PermissionDecision)>>,
 }
 
 impl AgentRunner for FakeRunner {
@@ -174,6 +189,7 @@ impl AgentRunner for FakeRunner {
             request.working_directory.into(),
             request.prompt.into(),
         ));
+        self.modes.lock().unwrap().push(request.permission_mode);
         for event in &self.emitted {
             emit(event.clone());
         }
@@ -189,12 +205,12 @@ impl AgentRunner for FakeRunner {
         &self,
         _run_id: RunId,
         request_id: &str,
-        allow: bool,
+        decision: PermissionDecision,
     ) -> Result<(), RunnerError> {
         self.answers
             .lock()
             .unwrap()
-            .push((request_id.to_owned(), allow));
+            .push((request_id.to_owned(), decision));
         Ok(())
     }
 }
@@ -316,6 +332,7 @@ fn fixture_with_events(emitted: Vec<RunnerEvent>) -> Fixture {
         requests: Mutex::new(Vec::new()),
         cancelled: Mutex::new(Vec::new()),
         answers: Mutex::new(Vec::new()),
+        modes: Mutex::new(Vec::new()),
     });
     let worktrees = Arc::new(FakeWorktrees::default());
     let core = TomaCore::new(
@@ -559,6 +576,7 @@ fn cancellation_uses_persisted_run_relationships_after_restart() {
             status: WorkStatus::Working,
             created_at: 1,
             updated_at: 1,
+            permission_mode: PermissionMode::Ask,
         });
         snapshot.sessions.push(session);
         snapshot.runs.push(run.clone());
@@ -760,6 +778,7 @@ fn permission_requests_wait_for_the_person_and_are_logged() {
         request_id: "r1".into(),
         tool: "Bash".into(),
         detail: "git push".into(),
+        rule: "git push".into(),
     }]);
     fixture
         .core
@@ -783,19 +802,21 @@ fn permission_requests_wait_for_the_person_and_are_logged() {
         .dispatch(AppCommand::AnswerPermission {
             run_id,
             request_id: "r1".into(),
-            allow: true,
+            decision: PermissionDecision::SwitchToAuto,
         })
         .unwrap();
     let live = fixture.core.cached_snapshot(fixture.workspace_id).unwrap();
     assert_eq!(
         *fixture.runner.answers.lock().unwrap(),
-        [("r1".to_owned(), true)]
+        [("r1".to_owned(), PermissionDecision::SwitchToAuto)]
     );
     assert!(live.permission_requests.is_empty());
     assert_eq!(live.runs[0].status, WorkStatus::Working);
+    assert!(live.messages.last().unwrap().body.contains("Auto mode"));
+    assert_eq!(live.threads[0].permission_mode, PermissionMode::Auto);
     assert_eq!(
-        live.messages.last().unwrap().body,
-        "Allowed **Bash**: `git push`"
+        fixture.store.snapshot.lock().unwrap().threads[0].permission_mode,
+        PermissionMode::Auto
     );
     assert!(
         fixture
@@ -803,10 +824,25 @@ fn permission_requests_wait_for_the_person_and_are_logged() {
             .dispatch(AppCommand::AnswerPermission {
                 run_id,
                 request_id: "r1".into(),
-                allow: true,
+                decision: PermissionDecision::Allow,
             })
             .is_err(),
         "a request is answered once"
+    );
+
+    // The next run in the thread starts in Auto.
+    fixture
+        .core
+        .dispatch(AppCommand::PostMessage {
+            channel_id: fixture.channel_id,
+            thread_id: Some(live.threads[0].id),
+            body: "Carry on".into(),
+            attachments: Vec::new(),
+        })
+        .unwrap();
+    assert_eq!(
+        *fixture.runner.modes.lock().unwrap(),
+        [PermissionMode::Ask, PermissionMode::Auto]
     );
 }
 

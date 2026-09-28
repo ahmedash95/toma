@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use toma_domain::{RunId, RunnerProvider, SessionId};
+use toma_domain::{PermissionMode, RunId, RunnerProvider, SessionId};
 use toma_runner::{AgentRunner, CursorCliRunner, RunRequest, RunnerEvent};
 
 const SAMPLE: &str = r#"{"type":"system","subtype":"init","apiKeySource":"login","cwd":"/tmp","session_id":"4a7a90fc","model":"Composer 2.5 Fast","permissionMode":"default"}
@@ -41,6 +41,7 @@ fn run(
                 provider_session_id: resume,
                 working_directory: dir,
                 prompt,
+                permission_mode: PermissionMode::Ask,
             },
             &mut |event| events.push(event),
         )

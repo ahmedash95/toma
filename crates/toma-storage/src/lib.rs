@@ -24,7 +24,7 @@ macro_rules! from_json {
     };
 }
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const MIGRATION_1: &str = include_str!("migration_1.sql");
 
 #[derive(Debug, Error)]
@@ -69,6 +69,7 @@ pub trait TomaStore: Send + Sync {
     ) -> StorageResult<()>;
     fn save_worktree(&self, worktree: &WorktreeRecord) -> StorageResult<()>;
     fn save_run_usage(&self, usage: &RunUsage) -> StorageResult<()>;
+    fn set_permission_mode(&self, thread_id: ThreadId, mode: PermissionMode) -> StorageResult<()>;
     fn set_provider_session_id(
         &self,
         session_id: SessionId,
@@ -478,6 +479,14 @@ impl TomaStore for SqliteStore {
         Ok(())
     }
 
+    fn set_permission_mode(&self, thread_id: ThreadId, mode: PermissionMode) -> StorageResult<()> {
+        self.connection()?.execute(
+            "UPDATE threads SET permission_mode = ?2 WHERE id = ?1",
+            params![thread_id.to_string(), to_json!(&mode)?],
+        )?;
+        Ok(())
+    }
+
     fn save_run_usage(&self, usage: &RunUsage) -> StorageResult<()> {
         self.connection()?.execute(
             "INSERT INTO run_usage (run_id, input_tokens, output_tokens, cached_tokens, cost_micros, duration_ms)
@@ -542,6 +551,14 @@ fn migrate(connection: &mut Connection) -> StorageResult<()> {
         tx.pragma_update(None, "user_version", 3)?;
         tx.commit()?;
     }
+    if version < 4 {
+        let tx = connection.transaction()?;
+        tx.execute_batch(
+            "ALTER TABLE threads ADD COLUMN permission_mode TEXT NOT NULL DEFAULT '\"ask\"'",
+        )?;
+        tx.pragma_update(None, "user_version", 4)?;
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -570,8 +587,8 @@ fn insert_message_row(tx: &Transaction<'_>, message: &Message) -> StorageResult<
 
 fn insert_thread_row(tx: &Transaction<'_>, thread: &TaskThread) -> StorageResult<()> {
     tx.execute(
-        "INSERT INTO threads (id, channel_id, root_message_id, title, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![thread.id.to_string(), thread.channel_id.to_string(), thread.root_message_id.to_string(), thread.title, to_json!(&thread.status)?, thread.created_at, thread.updated_at],
+        "INSERT INTO threads (id, channel_id, root_message_id, title, status, created_at, updated_at, permission_mode) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![thread.id.to_string(), thread.channel_id.to_string(), thread.root_message_id.to_string(), thread.title, to_json!(&thread.status)?, thread.created_at, thread.updated_at, to_json!(&thread.permission_mode)?],
     )?;
     Ok(())
 }
@@ -677,7 +694,7 @@ query_entities!(
 query_entities!(
     query_threads,
     TaskThread,
-    "SELECT t.id, t.channel_id, t.root_message_id, t.title, t.status, t.created_at, t.updated_at FROM threads t JOIN channels c ON c.id = t.channel_id WHERE c.workspace_id = ?1 ORDER BY t.created_at, t.id",
+    "SELECT t.id, t.channel_id, t.root_message_id, t.title, t.status, t.created_at, t.updated_at, t.permission_mode FROM threads t JOIN channels c ON c.id = t.channel_id WHERE c.workspace_id = ?1 ORDER BY t.created_at, t.id",
     |row| -> rusqlite::Result<StorageResult<TaskThread>> {
         Ok(Ok(TaskThread {
             id: parse_id(&row.get::<_, String>(0)?)?,
@@ -687,6 +704,7 @@ query_entities!(
             status: from_json!(&row.get::<_, String>(4)?)?,
             created_at: row.get(5)?,
             updated_at: row.get(6)?,
+            permission_mode: from_json!(&row.get::<_, String>(7)?)?,
         }))
     }
 );

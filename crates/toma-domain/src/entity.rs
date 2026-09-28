@@ -103,6 +103,33 @@ pub struct TaskThread {
     pub status: WorkStatus,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
+    pub permission_mode: PermissionMode,
+}
+
+/// How much agents in a thread may do without asking. Each provider maps it to its own
+/// native mode (Claude `--permission-mode`, Codex sandbox/`--approve-for-me`, Cursor `--mode`).
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    /// Edits in the working folder proceed; commands and anything outside ask the person.
+    #[default]
+    Ask,
+    /// The provider's own reviewer answers for the person.
+    Auto,
+    /// Read-only: the agent analyzes and proposes, without editing.
+    Plan,
+}
+
+/// The person's answer to a permission request, sent back through the provider's protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDecision {
+    Deny,
+    Allow,
+    /// Allow, and stop asking about the same command (or tool) for this session.
+    AlwaysAllow,
+    /// Allow, and let the provider's reviewer answer from now on.
+    SwitchToAuto,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -161,6 +188,8 @@ pub struct PermissionRequest {
     pub agent_id: AgentId,
     pub tool: String,
     pub detail: String,
+    /// What "Always allow" would cover, such as `git push` or `Write`.
+    pub rule: String,
 }
 
 /// What a run consumed, as reported by the provider at the end of the run.

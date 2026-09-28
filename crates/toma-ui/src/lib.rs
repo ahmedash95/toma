@@ -103,7 +103,7 @@ fn sample_snapshot() -> WorkspaceSnapshot {
             Message { id: MessageId::new(), channel_id: general_id, thread_id: Some(thread_id), author: MessageAuthor::Agent(builder_id), body: "The main pane and thread context stay independent, including their drafts.".into(), created_at: 4 },
             Message { id: MessageId::new(), channel_id: shipping_id, thread_id: None, author: MessageAuthor::Person(person_id), body: "Prepare the release notes once the shell is ready.".into(), created_at: 5 },
         ],
-        threads: vec![TaskThread { id: thread_id, channel_id: general_id, root_message_id: root_id, title: "Native shell polish".into(), status: WorkStatus::Working, created_at: 1, updated_at: 4 }],
+        threads: vec![TaskThread { id: thread_id, channel_id: general_id, root_message_id: root_id, title: "Native shell polish".into(), status: WorkStatus::Working, created_at: 1, updated_at: 4, permission_mode: PermissionMode::Ask }],
         sessions: vec![
             AgentSession { id: builder_session, thread_id, agent_id: builder_id, provider_session_id: None, status: WorkStatus::Working, created_at: 1 },
             AgentSession { id: reviewer_session, thread_id, agent_id: reviewer_id, provider_session_id: None, status: WorkStatus::WaitingForInput, created_at: 2 },

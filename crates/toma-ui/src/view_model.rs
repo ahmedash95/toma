@@ -270,6 +270,7 @@ mod tests {
                     status: WorkStatus::Working,
                     created_at: 0,
                     updated_at: 0,
+                    permission_mode: PermissionMode::Ask,
                 }],
                 ..Default::default()
             },

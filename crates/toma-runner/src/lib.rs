@@ -34,6 +34,7 @@ pub struct RunRequest<'a> {
     pub provider_session_id: Option<&'a str>,
     pub working_directory: &'a Path,
     pub prompt: &'a str,
+    pub permission_mode: PermissionMode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,6 +61,7 @@ pub enum RunnerEvent {
         request_id: String,
         tool: String,
         detail: String,
+        rule: String,
     },
     Completed,
     Failed(String),
@@ -90,7 +92,7 @@ pub trait AgentRunner: Send + Sync {
         &self,
         _run_id: RunId,
         _request_id: &str,
-        _allow: bool,
+        _decision: PermissionDecision,
     ) -> Result<(), RunnerError> {
         Err(RunnerError::Protocol(
             "this runner does not ask for permission".into(),

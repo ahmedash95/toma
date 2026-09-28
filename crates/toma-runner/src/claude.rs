@@ -4,7 +4,7 @@ use crate::{AgentRunner, RunRequest, RunnerCapabilities, RunnerError, RunnerEven
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use toma_domain::{RunId, RunnerProvider};
+use toma_domain::{PermissionDecision, PermissionMode, RunId, RunnerProvider};
 
 #[derive(Clone)]
 pub struct ClaudeCodeRunner {
@@ -60,7 +60,11 @@ impl ClaudeCodeRunner {
             OsString::from("--verbose"),
             OsString::from("--include-partial-messages"),
             OsString::from("--permission-mode"),
-            OsString::from(&self.permission_mode),
+            OsString::from(match request.permission_mode {
+                PermissionMode::Ask => self.permission_mode.as_str(),
+                PermissionMode::Auto => "auto",
+                PermissionMode::Plan => "plan",
+            }),
         ];
         match (&self.approval_bridge, socket) {
             (Some(bridge), Some(socket)) => {
@@ -196,7 +200,7 @@ impl AgentRunner for ClaudeCodeRunner {
         &self,
         _run_id: RunId,
         request_id: &str,
-        allow: bool,
+        decision: PermissionDecision,
     ) -> Result<(), RunnerError> {
         let answer = self
             .pending
@@ -205,7 +209,7 @@ impl AgentRunner for ClaudeCodeRunner {
             .remove(request_id)
             .ok_or_else(|| RunnerError::Protocol(format!("no pending request {request_id}")))?;
         answer
-            .send(allow)
+            .send(decision)
             .map_err(|_| RunnerError::Protocol("the run stopped waiting".into()))
     }
 }
