@@ -5532,7 +5532,12 @@ dependencies = [
 name = "toma"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "toma-core",
+ "toma-runner",
+ "toma-storage",
  "toma-ui",
+ "toma-worktree",
 ]
 
 [[package]]
@@ -5584,6 +5589,7 @@ dependencies = [
  "gpui",
  "toma-core",
  "toma-domain",
+ "toma-storage",
 ]
 
 [[package]]

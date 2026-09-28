@@ -9,4 +9,4 @@ license.workspace = true
 gpui.workspace = true
 toma-core.workspace = true
 toma-domain.workspace = true
-
+toma-storage.workspace = true

@@ -11,19 +11,19 @@ This backlog is ordered by dependency. Ownership is exclusive while an item is i
 
 ## Parallel Implementation
 
-- [ ] Implement SQLite migrations, WAL configuration, repositories, seed data, restart recovery, and persistence tests. Owner: storage agent
-- [ ] Implement the provider-neutral runner, a functional Claude CLI adapter, a transparent Codex availability adapter, cancellation, and event streaming tests. Owner: runner agent
-- [ ] Implement lazy Git worktree creation, branch ownership, a single-writer lock, conservative cleanup decisions, and tests using temporary repositories. Owner: worktree agent
-- [ ] Implement application orchestration for posting messages, structured agent mentions, thread/session/run creation, collaborator attachment, lifecycle events, and recovery. Owner: core agent
-- [ ] Implement the GPUI workspace shell, channel navigation, conversation and thread panes, status indicators, multiline composer, drafts, and mention palette. Owner: UI agent
+- [x] Implement SQLite migrations, WAL configuration, repositories, seed data, restart recovery, and persistence tests. Owner: Rawls (`toma-storage`)
+- [x] Implement the provider-neutral runner, a functional Claude CLI adapter, a transparent Codex availability adapter, cancellation, and event streaming tests. Owner: Bacon (`toma-runner`)
+- [x] Implement lazy Git worktree creation, branch ownership, a single-writer lock, conservative cleanup decisions, and tests using temporary repositories. Owner: Curie (`toma-worktree`)
+- [x] Implement application orchestration for posting messages, structured agent mentions, thread/session/run creation, collaborator attachment, lifecycle events, and recovery. Owner: Peirce (`toma-core`)
+- [x] Implement the GPUI workspace shell, channel navigation, conversation and thread panes, status indicators, multiline composer, drafts, and mention palette. Owner: Bernoulli (`toma-ui`)
 
 ## Integration And Verification
 
-- [ ] Wire the desktop binary to storage, orchestration, runners, worktrees, and GPUI. Owner: coordinator
-- [ ] Add an app bundle build script and local development launch command. Owner: coordinator
-- [ ] Run formatting, unit tests, integration tests, Clippy, and a release build. Owner: coordinator
+- [x] Wire the desktop binary to storage, orchestration, runners, worktrees, and GPUI. Owner: coordinator
+- [x] Add an app bundle build script and local development launch command. Owner: coordinator
+- [x] Run formatting, unit tests, integration tests, Clippy, and a release build. Owner: coordinator
 - [ ] Launch the macOS app and verify the primary workflow visually and interactively. Owner: coordinator
-- [ ] Document how to build, launch, and exercise the first MVP. Owner: coordinator
+- [x] Document how to build, launch, and exercise the first MVP. Owner: coordinator
 
 ## First-Build Acceptance
 

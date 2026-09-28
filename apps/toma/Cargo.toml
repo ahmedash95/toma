@@ -6,5 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+toma-core.workspace = true
+toma-runner.workspace = true
+toma-storage.workspace = true
 toma-ui.workspace = true
-
+toma-worktree.workspace = true
