@@ -6,8 +6,10 @@ use std::rc::Rc;
 
 use gpui::{
     App, Div, ElementId, FocusHandle, FontWeight, KeyBinding, SharedString, Stateful, Window,
-    actions, div, prelude::*, px,
+    actions, div, prelude::*,
 };
+
+use crate::zoom::px;
 
 use crate::Theme;
 

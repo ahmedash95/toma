@@ -5,6 +5,7 @@ mod markdown;
 mod shell;
 mod theme;
 mod view_model;
+mod zoom;
 
 pub use composer::{ComposerModel, MentionCandidate, bind_keys};
 pub use markdown::render_markdown;
@@ -36,6 +37,7 @@ fn open(snapshot: WorkspaceSnapshot, backend: Option<(Arc<TomaCore>, WorkspaceId
         .with_assets(icons::Assets)
         .run(move |cx: &mut App| {
             cx.set_global(Theme::for_appearance(cx.window_appearance()));
+            zoom::init(cx);
             bind_keys(cx);
             controls::bind_keys(cx);
             let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);

@@ -1,8 +1,10 @@
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Context, Entity, FocusHandle, Focusable, FontWeight,
     Hsla, IntoElement, MouseButton, MouseMoveEvent, PathPromptOptions, Render, ScrollHandle,
-    SharedString, Subscription, Window, div, prelude::*, pulsating_between, px, rgb,
+    SharedString, Subscription, Window, div, prelude::*, pulsating_between, rgb,
 };
+
+use crate::zoom::px;
 use std::{
     collections::{HashMap, HashSet},
     rc::Rc,
@@ -1077,6 +1079,8 @@ impl Render for TomaShell {
             self.channel_scroll.scroll_to_bottom();
             self.thread_scroll.scroll_to_bottom();
         }
+        // Scales rem-based sizes (text_sm and friends) along with px().
+        window.set_rem_size(gpui::px(16.) * crate::zoom::zoom());
         self.prepare_request_focus(window, cx);
         if let Some(focus) = self.pending_focus.take() {
             window.focus(&focus);
@@ -1090,7 +1094,10 @@ impl Render for TomaShell {
             .when(self.resizing_thread, |root| root.cursor_col_resize())
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 if this.resizing_thread {
-                    let width = (window.viewport_size().width - event.position.x) / px(1.);
+                    // Stored unzoomed, since px() applies the zoom when drawing.
+                    let width = (window.viewport_size().width - event.position.x)
+                        / gpui::px(1.)
+                        / crate::zoom::zoom();
                     this.thread_width = width.clamp(THREAD_WIDTH.0, THREAD_WIDTH.1);
                     cx.notify();
                 }

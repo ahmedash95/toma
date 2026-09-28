@@ -7,14 +7,20 @@ use gpui::{
     InspectorElementId, IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render, ScrollWheelEvent, SharedString,
     Style, Task, TextRun, UTF16Selection, UnderlineStyle, WeakEntity, Window, WrappedLine, div,
-    fill, point, prelude::*, px, relative, size,
+    fill, point, prelude::*, relative, size,
 };
+
+use crate::zoom::px;
 use toma_domain::AgentId;
 
 use crate::Theme;
 
-const FONT_SIZE: Pixels = px(13.);
-const LINE_HEIGHT: Pixels = px(20.);
+fn font_size() -> Pixels {
+    px(13.)
+}
+fn line_height() -> Pixels {
+    px(20.)
+}
 const MAX_LINES: f32 = 8.;
 const BLINK: Duration = Duration::from_millis(530);
 
@@ -385,11 +391,11 @@ impl Layout {
         for (start, line) in self.line_starts() {
             if index <= start + line.len() {
                 let p = line
-                    .position_for_index(index - start, LINE_HEIGHT)
+                    .position_for_index(index - start, line_height())
                     .unwrap_or_default();
                 return point(p.x, y + p.y);
             }
-            y += line.size(LINE_HEIGHT).height;
+            y += line.size(line_height()).height;
         }
         point(px(0.), y)
     }
@@ -398,11 +404,11 @@ impl Layout {
         let mut y = px(0.);
         let mut end = 0;
         for (start, line) in self.line_starts() {
-            let height = line.size(LINE_HEIGHT).height;
+            let height = line.size(line_height()).height;
             end = start + line.len();
             if p.y < y + height {
                 let local = point(p.x, (p.y - y).max(px(0.)));
-                let found = line.closest_index_for_position(local, LINE_HEIGHT);
+                let found = line.closest_index_for_position(local, line_height());
                 return start + found.unwrap_or_else(|e| e);
             }
             y += height;
@@ -413,7 +419,7 @@ impl Layout {
     fn height(&self) -> Pixels {
         self.lines
             .iter()
-            .fold(px(0.), |acc, l| acc + l.size(LINE_HEIGHT).height)
+            .fold(px(0.), |acc, l| acc + l.size(line_height()).height)
     }
 }
 
@@ -507,7 +513,7 @@ impl Composer {
 
     fn move_vertical(&mut self, delta: f32, cx: &mut Context<Self>) {
         let p = self.layout.point_for_index(self.model.cursor());
-        let y = p.y + LINE_HEIGHT * (delta + 0.5);
+        let y = p.y + line_height() * (delta + 0.5);
         let index = if y < px(0.) {
             0
         } else {
@@ -724,7 +730,7 @@ impl Composer {
     }
 
     fn on_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.scroll_y -= event.delta.pixel_delta(LINE_HEIGHT).y;
+        self.scroll_y -= event.delta.pixel_delta(line_height()).y;
         cx.notify();
     }
 
@@ -863,7 +869,7 @@ impl EntityInputHandler for Composer {
         let origin = bounds.origin - point(px(0.), self.scroll_y);
         Some(Bounds::from_corners(
             origin + start,
-            origin + point(end.x.max(start.x + px(1.)), end.y + LINE_HEIGHT),
+            origin + point(end.x.max(start.x + px(1.)), end.y + line_height()),
         ))
     }
 
@@ -924,7 +930,7 @@ fn shape(
     };
     window
         .text_system()
-        .shape_text(text, FONT_SIZE, &runs, width, None)
+        .shape_text(text, font_size(), &runs, width, None)
         .map(|lines| lines.into_vec())
         .unwrap_or_default()
 }
@@ -996,10 +1002,10 @@ impl gpui::Element for TextElement {
             );
             let content: Pixels = lines
                 .iter()
-                .fold(px(0.), |acc, l| acc + l.size(LINE_HEIGHT).height);
+                .fold(px(0.), |acc, l| acc + l.size(line_height()).height);
             size(
                 width.unwrap_or_default(),
-                content.min(LINE_HEIGHT * MAX_LINES).max(LINE_HEIGHT),
+                content.min(line_height() * MAX_LINES).max(line_height()),
             )
         });
         (id, ())
@@ -1039,8 +1045,8 @@ impl gpui::Element for TextElement {
             let y = layout.point_for_index(cursor).y;
             if y < scroll_y {
                 scroll_y = y;
-            } else if y + LINE_HEIGHT > scroll_y + bounds.size.height {
-                scroll_y = y + LINE_HEIGHT - bounds.size.height;
+            } else if y + line_height() > scroll_y + bounds.size.height {
+                scroll_y = y + line_height() - bounds.size.height;
             }
         }
         let scroll_y = scroll_y.clamp(px(0.), max_scroll);
@@ -1058,18 +1064,18 @@ impl gpui::Element for TextElement {
                 quads.push(fill(
                     Bounds::new(
                         origin + point(left, y),
-                        size((right - left).max(px(4.)), LINE_HEIGHT),
+                        size((right - left).max(px(4.)), line_height()),
                     ),
                     fill_color,
                 ));
-                y += LINE_HEIGHT;
+                y += line_height();
             }
         }
         let caret = selection.is_empty().then(|| {
             fill(
                 Bounds::new(
                     origin + layout.point_for_index(cursor),
-                    size(px(2.), LINE_HEIGHT),
+                    size(px(2.), line_height()),
                 ),
                 theme.accent,
             )
@@ -1105,9 +1111,16 @@ impl gpui::Element for TextElement {
             }
             let mut origin = bounds.origin - point(px(0.), prepaint.scroll_y);
             for line in &prepaint.lines {
-                line.paint(origin, LINE_HEIGHT, gpui::TextAlign::Left, None, window, cx)
-                    .ok();
-                origin.y += line.size(LINE_HEIGHT).height;
+                line.paint(
+                    origin,
+                    line_height(),
+                    gpui::TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                )
+                .ok();
+                origin.y += line.size(line_height()).height;
             }
             if focus.is_focused(window)
                 && visible
@@ -1169,7 +1182,7 @@ impl Render for Composer {
                                 .when(index == selected, |row| row.bg(theme.selection))
                                 .child(
                                     div()
-                                        .text_size(FONT_SIZE)
+                                        .text_size(font_size())
                                         .text_color(theme.text)
                                         .child(format!("@{}", mention.name)),
                                 )
@@ -1230,8 +1243,8 @@ impl Render for Composer {
                         theme.separator
                     })
                     .bg(theme.control_bg)
-                    .text_size(FONT_SIZE)
-                    .line_height(LINE_HEIGHT)
+                    .text_size(font_size())
+                    .line_height(line_height())
                     .text_color(theme.text)
                     .child(TextElement { input: cx.entity() }),
             )

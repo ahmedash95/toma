@@ -4,8 +4,10 @@ use std::ops::Range;
 
 use gpui::{
     AnyElement, App, ElementId, FontStyle, FontWeight, Hsla, InteractiveText, IntoElement,
-    ParentElement, SharedString, Styled, StyledText, TextRun, UnderlineStyle, div, font, px,
+    ParentElement, SharedString, Styled, StyledText, TextRun, UnderlineStyle, div, font,
 };
+
+use crate::zoom::px;
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::Theme;
