@@ -190,6 +190,22 @@ impl TomaShell {
         });
     }
 
+    fn answer_permission(&self, request: &PermissionRequest, allow: bool) {
+        let Some((core, _)) = self.backend.clone() else {
+            return;
+        };
+        let command = AppCommand::AnswerPermission {
+            run_id: request.run_id,
+            request_id: request.id.clone(),
+            allow,
+        };
+        std::thread::spawn(move || {
+            if let Err(error) = core.dispatch(command) {
+                eprintln!("toma: answering permission failed: {error}");
+            }
+        });
+    }
+
     fn new_channel(&mut self, cx: &mut Context<Self>) {
         let Some((core, workspace_id)) = self.backend.clone() else {
             return;
@@ -464,6 +480,12 @@ impl TomaShell {
                 .filter(|message| message.thread_id == Some(id))
                 .count();
             let working = self.model.working_agents(id);
+            let needs_approval = self
+                .model
+                .snapshot
+                .permission_requests
+                .iter()
+                .any(|request| request.thread_id == id);
             div()
                 .mt_1()
                 .flex()
@@ -484,6 +506,20 @@ impl TomaShell {
                             n => format!("{n} replies"),
                         }),
                 )
+                .children(needs_approval.then(|| {
+                    div()
+                        .id(SharedString::from(format!("approve-{id}")))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.orange)
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| this.open_thread(id, cx)))
+                        .child(div().size(px(7.)).rounded_full().bg(theme.orange))
+                        .child("Needs your approval")
+                }))
                 .children(
                     (!working.is_empty())
                         .then(|| typing_indicator(&working, &format!("typing-{id}"), theme)),
@@ -529,6 +565,18 @@ impl TomaShell {
         let replies: Vec<_> = self.model.messages_for(Some(thread_id)).cloned().collect();
         let reply_count = replies.len();
         let working = self.model.working_agents(thread_id);
+        let requests: Vec<_> = self
+            .model
+            .snapshot
+            .permission_requests
+            .iter()
+            .filter(|request| request.thread_id == thread_id)
+            .cloned()
+            .collect();
+        let cards: Vec<_> = requests
+            .into_iter()
+            .map(|request| self.permission_card(request, theme, cx).into_any_element())
+            .collect();
 
         Some(
             div()
@@ -618,6 +666,7 @@ impl TomaShell {
                                 .into_iter()
                                 .map(|message| self.thread_message(message, theme)),
                         )
+                        .children(cards)
                         .children((!working.is_empty()).then(|| {
                             div()
                                 .py_2()
@@ -633,6 +682,85 @@ impl TomaShell {
                         .child(self.thread_composer.clone()),
                 ),
         )
+    }
+
+    fn permission_card(
+        &self,
+        request: PermissionRequest,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let agent = self
+            .model
+            .author_name(MessageAuthor::Agent(request.agent_id))
+            .to_owned();
+        let button = |id: &str, label: &'static str| {
+            div()
+                .id(SharedString::from(format!("{id}-{}", request.id)))
+                .px_3()
+                .py(px(3.))
+                .rounded(px(6.))
+                .text_size(px(12.))
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .child(label)
+        };
+        let (deny, allow) = (request.clone(), request.clone());
+        div()
+            .my_2()
+            .p_3()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(theme.orange)
+            .bg(theme.control_bg)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().size(px(7.)).rounded_full().bg(theme.orange))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(format!("{agent} wants to use {}", request.tool)),
+                    ),
+            )
+            .child(
+                div()
+                    .mt_2()
+                    .px_2()
+                    .py_1()
+                    .rounded(px(5.))
+                    .bg(theme.code_bg)
+                    .font_family("Menlo")
+                    .text_size(px(12.))
+                    .child(request.detail.clone()),
+            )
+            .child(
+                div()
+                    .mt_3()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        button("deny", "Deny")
+                            .border_1()
+                            .border_color(theme.separator)
+                            .hover(|b| b.opacity(0.8))
+                            .on_click(cx.listener(move |this, _, _, _| {
+                                this.answer_permission(&deny, false)
+                            })),
+                    )
+                    .child(
+                        button("allow", "Allow")
+                            .bg(theme.accent)
+                            .text_color(gpui::white())
+                            .hover(|b| b.opacity(0.85))
+                            .on_click(cx.listener(move |this, _, _, _| {
+                                this.answer_permission(&allow, true)
+                            })),
+                    ),
+            )
     }
 
     fn thread_message(&self, message: Message, theme: &Theme) -> impl IntoElement {

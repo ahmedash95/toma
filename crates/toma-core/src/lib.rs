@@ -149,6 +149,11 @@ impl TomaCore {
                 agent_id,
             } => self.attach_agent(thread_id, agent_id),
             AppCommand::CancelRun { run_id } => self.cancel_run(run_id),
+            AppCommand::AnswerPermission {
+                run_id,
+                request_id,
+                allow,
+            } => self.answer_permission(run_id, &request_id, allow),
         }
     }
 
@@ -627,6 +632,32 @@ impl TomaCore {
                 events.push(AppEvent::MessagePosted { message_id });
             }
             RunnerEvent::ReplyDelta(_) => unreachable!("handled above"),
+            RunnerEvent::PermissionRequest {
+                request_id,
+                tool,
+                detail,
+            } => {
+                self.ensure_run_started(run_id, events)?;
+                {
+                    let mut state = self.state()?;
+                    let snapshot = state
+                        .snapshots
+                        .values_mut()
+                        .find(|snapshot| snapshot.runs.iter().any(|run| run.id == run_id))
+                        .ok_or_else(|| CoreError::InvalidCommand("unknown run".into()))?;
+                    let (thread_id, agent_id) = run_owner(snapshot, run_id)?;
+                    snapshot.permission_requests.push(PermissionRequest {
+                        id: request_id.clone(),
+                        run_id,
+                        thread_id,
+                        agent_id,
+                        tool,
+                        detail,
+                    });
+                }
+                self.transition_run(run_id, WorkStatus::WaitingForInput, events)?;
+                events.push(AppEvent::PermissionRequested { run_id, request_id });
+            }
             RunnerEvent::WaitingForInput(text) => {
                 self.ensure_run_started(run_id, events)?;
                 events.push(AppEvent::RunnerOutput { run_id, text });
@@ -702,6 +733,75 @@ impl TomaCore {
             status: next,
         });
         Ok(())
+    }
+
+    /// Relays the person's decision to the waiting agent and records it in the thread.
+    fn answer_permission(
+        &self,
+        run_id: RunId,
+        request_id: &str,
+        allow: bool,
+    ) -> Result<Vec<AppEvent>, CoreError> {
+        let (provider, _) = self.run_provider_and_status(run_id)?;
+        let request = {
+            let mut state = self.state()?;
+            state.snapshots.values_mut().find_map(|snapshot| {
+                let index = snapshot
+                    .permission_requests
+                    .iter()
+                    .position(|request| request.id == request_id && request.run_id == run_id)?;
+                Some(snapshot.permission_requests.remove(index))
+            })
+        }
+        .ok_or_else(|| CoreError::InvalidCommand("no such pending permission request".into()))?;
+        self.runner(provider)?
+            .answer_permission(run_id, request_id, allow)?;
+
+        let mut events = Vec::new();
+        let still_waiting = self.state()?.snapshots.values().any(|snapshot| {
+            snapshot
+                .permission_requests
+                .iter()
+                .any(|request| request.run_id == run_id)
+        });
+        if !still_waiting && self.run_status(run_id)? == WorkStatus::WaitingForInput {
+            self.transition_run(run_id, WorkStatus::Working, &mut events)?;
+        }
+        let workspace_id = self.workspace_for_thread(request.thread_id)?;
+        let channel_id = {
+            let state = self.state()?;
+            let snapshot = state.snapshots.get(&workspace_id).expect("validated");
+            snapshot
+                .threads
+                .iter()
+                .find(|thread| thread.id == request.thread_id)
+                .expect("validated")
+                .channel_id
+        };
+        let message = Message {
+            id: MessageId::new(),
+            channel_id,
+            thread_id: Some(request.thread_id),
+            author: MessageAuthor::System,
+            body: format!(
+                "{} **{}**: `{}`",
+                if allow { "Allowed" } else { "Denied" },
+                request.tool,
+                request.detail.replace('`', "'")
+            ),
+            created_at: self.clock.now_ms(),
+        };
+        self.store.insert_message(&message, &[])?;
+        self.state()?
+            .snapshots
+            .get_mut(&workspace_id)
+            .expect("validated")
+            .messages
+            .push(message.clone());
+        events.push(AppEvent::MessagePosted {
+            message_id: message.id,
+        });
+        Ok(events)
     }
 
     fn cancel_run(&self, run_id: RunId) -> Result<Vec<AppEvent>, CoreError> {
@@ -920,6 +1020,9 @@ impl TomaCore {
                 }
                 if status.is_terminal() {
                     run.finished_at = Some(at);
+                    snapshot
+                        .permission_requests
+                        .retain(|request| request.run_id != run_id);
                 }
                 // Mirrors the store, which moves the session and thread with their run.
                 let session_id = run.session_id;
@@ -1162,6 +1265,19 @@ fn channel_name(folder: &Path) -> String {
     }
 }
 
+fn run_owner(
+    snapshot: &WorkspaceSnapshot,
+    run_id: RunId,
+) -> Result<(ThreadId, AgentId), CoreError> {
+    snapshot
+        .runs
+        .iter()
+        .find(|run| run.id == run_id)
+        .and_then(|run| snapshot.sessions.iter().find(|s| s.id == run.session_id))
+        .map(|session| (session.thread_id, session.agent_id))
+        .ok_or_else(|| CoreError::InvalidCommand("run has no session".into()))
+}
+
 /// Builds the agent's reply message for `run_id` if the run belongs to `snapshot`.
 fn reply_message(
     snapshot: &WorkspaceSnapshot,
@@ -1200,6 +1316,9 @@ fn raw_payload(event: &RunnerEvent) -> String {
         RunnerEvent::Output(text) => text.clone(),
         RunnerEvent::Reply(text) => format!("reply:{text}"),
         RunnerEvent::ReplyDelta(text) => text.clone(),
+        RunnerEvent::PermissionRequest { tool, detail, .. } => {
+            format!("permission_request:{tool}:{detail}")
+        }
         RunnerEvent::WaitingForInput(text) => format!("waiting_for_input:{text}"),
         RunnerEvent::Completed => "completed".into(),
         RunnerEvent::Failed(message) => format!("failed:{message}"),

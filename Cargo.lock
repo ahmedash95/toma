@@ -5544,7 +5544,9 @@ name = "toma"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "tempfile",
  "toma-core",
+ "toma-domain",
  "toma-runner",
  "toma-storage",
  "toma-ui",

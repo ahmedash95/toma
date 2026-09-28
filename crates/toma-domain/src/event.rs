@@ -38,6 +38,10 @@ pub enum AppEvent {
         channel_id: ChannelId,
         thread_id: Option<ThreadId>,
     },
+    PermissionRequested {
+        run_id: RunId,
+        request_id: String,
+    },
     RunnerOutput {
         run_id: RunId,
         text: String,

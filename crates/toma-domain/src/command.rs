@@ -34,4 +34,9 @@ pub enum AppCommand {
     CancelRun {
         run_id: RunId,
     },
+    AnswerPermission {
+        run_id: RunId,
+        request_id: String,
+        allow: bool,
+    },
 }

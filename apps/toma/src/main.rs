@@ -8,6 +8,14 @@ use toma_worktree::GitWorktreeManager;
 
 /// Usage: `toma [repository]`; defaults to the current directory.
 fn main() -> anyhow::Result<()> {
+    // Claude launches this executable as the MCP server that asks the person for permission.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "mcp-approval")
+    {
+        let socket = std::env::args_os().nth(2).context("missing socket path")?;
+        return Ok(toma_runner::run_approval_bridge(socket.as_ref())?);
+    }
     let repository = match std::env::args_os().nth(1) {
         Some(path) => PathBuf::from(path),
         None => std::env::current_dir()?,
@@ -30,7 +38,7 @@ fn main() -> anyhow::Result<()> {
         store,
         Arc::new(GitWorktreeManager),
         vec![
-            Arc::new(ClaudeCodeRunner::new()),
+            Arc::new(ClaudeCodeRunner::new().with_approvals(std::env::current_exe()?)),
             Arc::new(CodexCliRunner::new()),
         ],
         Arc::new(SystemClock),

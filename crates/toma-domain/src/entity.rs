@@ -150,3 +150,14 @@ pub struct WorktreeRecord {
     pub branch: String,
     pub created_at: TimestampMs,
 }
+
+/// An agent action waiting for the person to allow or deny it. Lives only as long as the run.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PermissionRequest {
+    pub id: String,
+    pub run_id: RunId,
+    pub thread_id: ThreadId,
+    pub agent_id: AgentId,
+    pub tool: String,
+    pub detail: String,
+}

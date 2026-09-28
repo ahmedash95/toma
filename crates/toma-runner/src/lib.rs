@@ -1,7 +1,9 @@
+mod approval;
 mod claude;
 mod codex;
 mod process;
 
+pub use approval::run_approval_bridge;
 pub use claude::ClaudeCodeRunner;
 pub use codex::CodexCliRunner;
 pub use process::find_executable;
@@ -43,6 +45,12 @@ pub enum RunnerEvent {
     /// A streamed fragment of the reply, ahead of the final `Reply`.
     ReplyDelta(String),
     WaitingForInput(String),
+    /// The agent is blocked until the person allows or denies `tool`.
+    PermissionRequest {
+        request_id: String,
+        tool: String,
+        detail: String,
+    },
     Completed,
     Failed(String),
     Cancelled,
@@ -68,6 +76,16 @@ pub trait AgentRunner: Send + Sync {
         emit: &mut dyn FnMut(RunnerEvent),
     ) -> Result<(), RunnerError>;
     fn cancel(&self, run_id: RunId) -> Result<(), RunnerError>;
+    fn answer_permission(
+        &self,
+        _run_id: RunId,
+        _request_id: &str,
+        _allow: bool,
+    ) -> Result<(), RunnerError> {
+        Err(RunnerError::Protocol(
+            "this runner does not ask for permission".into(),
+        ))
+    }
 }
 
 /// Forwards `event`, followed by whatever `parse` derives from it when it is a JSON output line.

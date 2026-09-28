@@ -36,7 +36,10 @@ impl CodexCliRunner {
             arguments.push(OsString::from("--json"));
         }
         arguments.push(OsString::from(request.prompt));
-        CommandSpec { arguments }
+        CommandSpec {
+            arguments,
+            events: None,
+        }
     }
 }
 

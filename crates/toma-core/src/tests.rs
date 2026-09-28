@@ -137,6 +137,7 @@ struct FakeRunner {
     emitted: Vec<RunnerEvent>,
     requests: Mutex<Vec<(RunId, SessionId, PathBuf, String)>>,
     cancelled: Mutex<Vec<RunId>>,
+    answers: Mutex<Vec<(String, bool)>>,
 }
 
 impl AgentRunner for FakeRunner {
@@ -176,6 +177,19 @@ impl AgentRunner for FakeRunner {
 
     fn cancel(&self, run_id: RunId) -> Result<(), RunnerError> {
         self.cancelled.lock().unwrap().push(run_id);
+        Ok(())
+    }
+
+    fn answer_permission(
+        &self,
+        _run_id: RunId,
+        request_id: &str,
+        allow: bool,
+    ) -> Result<(), RunnerError> {
+        self.answers
+            .lock()
+            .unwrap()
+            .push((request_id.to_owned(), allow));
         Ok(())
     }
 }
@@ -296,6 +310,7 @@ fn fixture_with_events(emitted: Vec<RunnerEvent>) -> Fixture {
         emitted,
         requests: Mutex::new(Vec::new()),
         cancelled: Mutex::new(Vec::new()),
+        answers: Mutex::new(Vec::new()),
     });
     let worktrees = Arc::new(FakeWorktrees::default());
     let core = TomaCore::new(
@@ -729,4 +744,61 @@ fn channels_take_their_folder_name_and_plain_folders_skip_worktrees() {
         .unwrap();
     assert_eq!(fixture.runner.requests.lock().unwrap()[0].2, path);
     assert!(fixture.worktrees.ensured.lock().unwrap().is_empty());
+}
+
+#[test]
+fn permission_requests_wait_for_the_person_and_are_logged() {
+    // The fake returns without completing, like a real run blocked on the prompt.
+    let fixture = fixture_with_events(vec![RunnerEvent::PermissionRequest {
+        request_id: "r1".into(),
+        tool: "Bash".into(),
+        detail: "git push".into(),
+    }]);
+    fixture
+        .core
+        .dispatch(AppCommand::PostMessage {
+            channel_id: fixture.channel_id,
+            thread_id: None,
+            body: "Ship it".into(),
+            attachments: vec![AttachmentTarget::Agent {
+                agent_id: fixture.agent_id,
+            }],
+        })
+        .unwrap();
+    let live = fixture.core.cached_snapshot(fixture.workspace_id).unwrap();
+    let run_id = live.runs[0].id;
+    assert_eq!(live.runs[0].status, WorkStatus::WaitingForInput);
+    assert_eq!(live.permission_requests.len(), 1);
+    assert_eq!(live.permission_requests[0].thread_id, live.threads[0].id);
+
+    fixture
+        .core
+        .dispatch(AppCommand::AnswerPermission {
+            run_id,
+            request_id: "r1".into(),
+            allow: true,
+        })
+        .unwrap();
+    let live = fixture.core.cached_snapshot(fixture.workspace_id).unwrap();
+    assert_eq!(
+        *fixture.runner.answers.lock().unwrap(),
+        [("r1".to_owned(), true)]
+    );
+    assert!(live.permission_requests.is_empty());
+    assert_eq!(live.runs[0].status, WorkStatus::Working);
+    assert_eq!(
+        live.messages.last().unwrap().body,
+        "Allowed **Bash**: `git push`"
+    );
+    assert!(
+        fixture
+            .core
+            .dispatch(AppCommand::AnswerPermission {
+                run_id,
+                request_id: "r1".into(),
+                allow: true,
+            })
+            .is_err(),
+        "a request is answered once"
+    );
 }

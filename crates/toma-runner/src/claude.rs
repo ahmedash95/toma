@@ -1,51 +1,96 @@
+use crate::approval::{self, ApprovalListener, Pending};
 use crate::process::{CommandSpec, ProcessRunner};
 use crate::{AgentRunner, RunRequest, RunnerCapabilities, RunnerError, RunnerEvent, translate};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use toma_domain::{RunId, RunnerProvider};
 
 #[derive(Clone)]
 pub struct ClaudeCodeRunner {
     process: ProcessRunner,
+    /// Executable serving `mcp-approval`; without it, prompts are denied automatically.
+    approval_bridge: Option<PathBuf>,
+    pending: Pending,
+    permission_mode: String,
 }
 
 impl ClaudeCodeRunner {
     pub fn new() -> Self {
-        Self {
-            process: ProcessRunner::discover("claude"),
-        }
+        Self::from_process(ProcessRunner::discover("claude"))
     }
 
     pub fn with_executable(executable: impl Into<PathBuf>) -> Self {
+        Self::from_process(ProcessRunner::with_executable(executable))
+    }
+
+    fn from_process(process: ProcessRunner) -> Self {
         Self {
-            process: ProcessRunner::with_executable(executable),
+            process,
+            approval_bridge: None,
+            pending: Pending::default(),
+            permission_mode: "auto".into(),
         }
+    }
+
+    /// Routes permission prompts to the person through `executable mcp-approval <socket>`.
+    /// Uses `acceptEdits`: edits in the working folder go ahead, commands and anything
+    /// outside the folder wait for the person. (`auto` never asks, so it would bypass them.)
+    pub fn with_approvals(mut self, executable: impl Into<PathBuf>) -> Self {
+        self.approval_bridge = Some(executable.into());
+        self.permission_mode = "acceptEdits".into();
+        self
+    }
+
+    /// Any `claude --permission-mode` value.
+    pub fn with_permission_mode(mut self, mode: impl Into<String>) -> Self {
+        self.permission_mode = mode.into();
+        self
     }
 
     pub fn executable(&self) -> &Path {
         self.process.executable()
     }
 
-    fn command(request: &RunRequest<'_>) -> CommandSpec {
+    fn command(&self, request: &RunRequest<'_>, socket: Option<&Path>) -> CommandSpec {
         let mut arguments = vec![
             OsString::from("--print"),
             OsString::from("--output-format"),
             OsString::from("stream-json"),
             OsString::from("--verbose"),
             OsString::from("--include-partial-messages"),
-            // Auto mode lets a safety classifier approve routine edits and commands; with
-            // no one to answer prompts, anything it would ask about is denied.
             OsString::from("--permission-mode"),
-            OsString::from("auto"),
-            OsString::from("--permission-prompts"),
-            OsString::from("none"),
+            OsString::from(&self.permission_mode),
         ];
+        match (&self.approval_bridge, socket) {
+            (Some(bridge), Some(socket)) => {
+                let config = serde_json::json!({ "mcpServers": { "toma": {
+                    "command": bridge,
+                    "args": ["mcp-approval", socket],
+                }}});
+                arguments.extend([
+                    OsString::from("--mcp-config"),
+                    OsString::from(config.to_string()),
+                    OsString::from("--permission-prompt-tool"),
+                    OsString::from(format!("mcp__toma__{}", approval::TOOL)),
+                    OsString::from("--permission-prompts"),
+                    OsString::from("host"),
+                ]);
+            }
+            _ => arguments.extend([
+                OsString::from("--permission-prompts"),
+                OsString::from("none"),
+            ]),
+        }
         if let Some(session_id) = request.provider_session_id {
             arguments.push(OsString::from("--resume"));
             arguments.push(OsString::from(session_id));
         }
         arguments.push(OsString::from(request.prompt));
-        CommandSpec { arguments }
+        CommandSpec {
+            arguments,
+            events: None,
+        }
     }
 }
 
@@ -89,7 +134,7 @@ impl AgentRunner for ClaudeCodeRunner {
             resume: true,
             streaming: true,
             cancellation: true,
-            permission_requests: false,
+            permission_requests: self.approval_bridge.is_some(),
         }
     }
 
@@ -102,7 +147,18 @@ impl AgentRunner for ClaudeCodeRunner {
         request: RunRequest<'_>,
         emit: &mut dyn FnMut(RunnerEvent),
     ) -> Result<(), RunnerError> {
-        let command = Self::command(&request);
+        // The listener lives exactly as long as the Claude process it serves.
+        let (events, listener) = match self.approval_bridge {
+            Some(_) => {
+                let (sender, receiver) = mpsc::channel();
+                let listener =
+                    ApprovalListener::start(request.run_id, self.pending.clone(), sender)?;
+                (Some(receiver), Some(listener))
+            }
+            None => (None, None),
+        };
+        let mut command = self.command(&request, listener.as_ref().map(|l| l.socket.as_path()));
+        command.events = events;
         self.process.run(request, command, &mut |event| {
             translate(event, emit, claude_event)
         })
@@ -110,5 +166,22 @@ impl AgentRunner for ClaudeCodeRunner {
 
     fn cancel(&self, run_id: RunId) -> Result<(), RunnerError> {
         self.process.cancel(run_id)
+    }
+
+    fn answer_permission(
+        &self,
+        _run_id: RunId,
+        request_id: &str,
+        allow: bool,
+    ) -> Result<(), RunnerError> {
+        let answer = self
+            .pending
+            .lock()
+            .map_err(|_| RunnerError::Protocol("approval lock poisoned".into()))?
+            .remove(request_id)
+            .ok_or_else(|| RunnerError::Protocol(format!("no pending request {request_id}")))?;
+        answer
+            .send(allow)
+            .map_err(|_| RunnerError::Protocol("the run stopped waiting".into()))
     }
 }

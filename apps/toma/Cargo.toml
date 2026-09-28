@@ -12,3 +12,7 @@ toma-runner.workspace = true
 toma-storage.workspace = true
 toma-ui.workspace = true
 toma-worktree.workspace = true
+toma-domain.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

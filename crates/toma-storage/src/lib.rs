@@ -89,6 +89,8 @@ pub struct WorkspaceSnapshot {
     pub drafts: Vec<Draft>,
     pub memories: Vec<ChannelMemory>,
     pub worktrees: Vec<WorktreeRecord>,
+    /// Live-only; never persisted because a restart ends the runs that asked.
+    pub permission_requests: Vec<PermissionRequest>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -289,6 +291,7 @@ impl TomaStore for SqliteStore {
             drafts: query_drafts(&connection, &workspace_key)?,
             memories: query_memories(&connection, &workspace_key)?,
             worktrees: query_worktrees(&connection, &workspace_key)?,
+            permission_requests: Vec::new(),
         })
     }
 

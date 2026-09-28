@@ -13,6 +13,8 @@ use toma_domain::RunId;
 
 pub(crate) struct CommandSpec {
     pub(crate) arguments: Vec<OsString>,
+    /// Events produced outside the process output, such as permission prompts.
+    pub(crate) events: Option<mpsc::Receiver<RunnerEvent>>,
 }
 
 struct ActiveProcess {
@@ -81,7 +83,7 @@ impl ProcessRunner {
     ) -> Result<(), RunnerError> {
         let mut command = Command::new(&self.executable);
         command
-            .args(spec.arguments)
+            .args(&spec.arguments)
             .current_dir(request.working_directory)
             .env("NO_COLOR", "1")
             .stdin(Stdio::null())
@@ -129,7 +131,13 @@ impl ProcessRunner {
         let stdout_reader = spawn_reader(stdout, false, sender.clone());
         let stderr_reader = spawn_reader(stderr, true, sender);
         let mut stderr_lines = Vec::new();
-        let result = drive_process(&active, receiver, &mut stderr_lines, emit);
+        let result = drive_process(
+            &active,
+            receiver,
+            spec.events.as_ref(),
+            &mut stderr_lines,
+            emit,
+        );
 
         if result.is_err() {
             let _ = active.child.lock().map_err(lock_error)?.kill();
@@ -195,11 +203,15 @@ impl ProcessRunner {
 fn drive_process(
     active: &ActiveProcess,
     receiver: mpsc::Receiver<StreamMessage>,
+    events: Option<&mpsc::Receiver<RunnerEvent>>,
     stderr_lines: &mut Vec<String>,
     emit: &mut dyn FnMut(RunnerEvent),
 ) -> Result<ExitStatus, RunnerError> {
     let mut streams_open = true;
     loop {
+        while let Some(event) = events.and_then(|events| events.try_recv().ok()) {
+            emit(event);
+        }
         if streams_open {
             match receiver.recv_timeout(Duration::from_millis(20)) {
                 Ok(StreamMessage::Line { line, stderr }) => {
