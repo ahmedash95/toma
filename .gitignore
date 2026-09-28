@@ -1,4 +1,5 @@
 /target
+/dist
 /.toma
 /.DS_Store
 *.db

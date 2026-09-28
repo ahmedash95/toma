@@ -30,3 +30,32 @@ Mention `@Claude` or `@Codex` in a channel to start a task thread; mention anoth
 
 Use `./scripts/build-app.sh release` for an optimized bundle at `target/release/Toma.app`. Early local bundles are unsigned and unnotarized, so macOS may require a one-time approval in System Settings under Privacy & Security.
 
+## Release And Homebrew
+
+Release builds produce a drag-to-install DMG and (optionally) update [ahmedash95/homebrew-tap](https://github.com/ahmedash95/homebrew-tap).
+
+Local dry run:
+
+```sh
+scripts/bundle.sh
+scripts/make_dmg.sh
+open dist/Toma-*.dmg
+```
+
+Publish a version (workspace `version` in `Cargo.toml` must match the tag):
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+On tag push, [`.github/workflows/release.yml`](.github/workflows/release.yml) builds on `macos-15`, uploads `Toma-<version>.dmg` to GitHub Releases, and bumps `Casks/toma.rb` in the tap when the `HOMEBREW_TAP_TOKEN` repository secret is set (fine-grained PAT with **Contents: read and write** on `ahmedash95/homebrew-tap` only).
+
+Install after the first release:
+
+```sh
+brew tap ahmedash95/tap
+brew install --cask toma
+```
+
+The cask template lives at [`packaging/homebrew/Casks/toma.rb`](packaging/homebrew/Casks/toma.rb). Current CI ships **Apple Silicon** builds only (`depends_on arch: :arm64`).
+
