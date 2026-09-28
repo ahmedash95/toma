@@ -697,7 +697,7 @@ fn section_header(label: &'static str, theme: &Theme) -> gpui::Div {
         .px_2()
         .text_size(px(11.))
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(theme.text_tertiary)
+        .text_color(theme.text_secondary)
         .child(label)
 }
 

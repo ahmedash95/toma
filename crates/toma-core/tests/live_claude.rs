@@ -79,3 +79,53 @@ fn claude_replies_in_the_thread_and_remembers_follow_ups() {
     assert_eq!(replies.len(), 2);
     assert!(replies[1].to_uppercase().contains("PELICAN"));
 }
+
+#[test]
+#[ignore = "calls the real Claude CLI"]
+fn claude_works_inside_a_plain_folder_channel() {
+    let state = TempDir::new().unwrap();
+    let folder = TempDir::new().unwrap();
+    std::fs::write(folder.path().join("breakfast-pancakes.txt"), "eggs, flour").unwrap();
+    let store = Arc::new(SqliteStore::open(state.path().join("toma.db")).unwrap());
+    let workspace_id = store.seed_demo_workspace(state.path()).unwrap();
+    let core = TomaCore::new(
+        store,
+        Arc::new(GitWorktreeManager),
+        vec![Arc::new(ClaudeCodeRunner::new())],
+        Arc::new(SystemClock),
+    );
+    let snapshot = core.recover(workspace_id).unwrap();
+    let claude = snapshot
+        .agents
+        .iter()
+        .find(|a| a.name == "Claude")
+        .unwrap()
+        .id;
+    let events = core
+        .dispatch(AppCommand::CreateChannel {
+            workspace_id,
+            repository_path: folder.path().to_owned(),
+        })
+        .unwrap();
+    let Some(AppEvent::ChannelCreated { channel_id }) = events.first().cloned() else {
+        panic!("no channel: {events:?}");
+    };
+
+    core.dispatch(AppCommand::PostMessage {
+        channel_id,
+        thread_id: None,
+        body: "@Claude list the file names in the current directory, nothing else.".into(),
+        attachments: vec![AttachmentTarget::Agent { agent_id: claude }],
+    })
+    .unwrap();
+    let snapshot = core.cached_snapshot(workspace_id).unwrap();
+    let reply = snapshot
+        .messages
+        .iter()
+        .find(|m| m.author == MessageAuthor::Agent(claude))
+        .map(|m| m.body.clone())
+        .unwrap_or_default();
+    println!("reply: {reply:?}");
+    assert!(reply.contains("breakfast-pancakes.txt"));
+    assert!(snapshot.worktrees.is_empty(), "plain folders run in place");
+}

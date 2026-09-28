@@ -921,6 +921,18 @@ impl TomaCore {
                 if status.is_terminal() {
                     run.finished_at = Some(at);
                 }
+                // Mirrors the store, which moves the session and thread with their run.
+                let session_id = run.session_id;
+                let Some(session) = snapshot.sessions.iter_mut().find(|s| s.id == session_id)
+                else {
+                    return Ok(());
+                };
+                session.status = status;
+                let thread_id = session.thread_id;
+                if let Some(thread) = snapshot.threads.iter_mut().find(|t| t.id == thread_id) {
+                    thread.status = status;
+                    thread.updated_at = at;
+                }
                 return Ok(());
             }
         }

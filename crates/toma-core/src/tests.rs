@@ -677,6 +677,8 @@ fn streamed_reply_grows_one_live_message_and_persists_on_completion() {
         assert_eq!(replies[0].body, "Hello");
     }
     assert!(fixture.core.revision() > 0);
+    assert_eq!(live.threads[0].status, WorkStatus::Completed);
+    assert_eq!(live.sessions[0].status, WorkStatus::Completed);
 }
 
 #[test]
