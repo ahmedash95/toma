@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <filter id="iconShadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#000" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+
+  <!-- macOS squircle tile: 824pt on a 1024 canvas -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="#262A52" filter="url(#iconShadow)"/>
+
+  <!-- chat bubble -->
+  <path d="M300 260 H724 A96 96 0 0 1 820 356 V596 A96 96 0 0 1 724 692 H470 L352 792 Q340 802 340 786 V692 H300 A96 96 0 0 1 204 596 V356 A96 96 0 0 1 300 260 Z"
+        fill="#FFFFFF"/>
+
+  <!-- thread: three agents joined on one line -->
+  <path d="M352 476 H672" stroke="#D5D7EA" stroke-width="18" stroke-linecap="round"/>
+  <circle cx="352" cy="476" r="52" fill="#F26B4F"/>
+  <circle cx="512" cy="476" r="52" fill="#F5B83D"/>
+  <circle cx="672" cy="476" r="52" fill="#3FBF9F"/>
+</svg>

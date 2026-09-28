@@ -30,6 +30,7 @@ resources_dir="$contents_dir/Resources"
 
 mkdir -p "$macos_dir" "$resources_dir"
 cp "$repo_root/target/$target_profile/toma" "$macos_dir/Toma"
+cp "$repo_root/assets/Toma.icns" "$resources_dir/Toma.icns"
 
 cat > "$contents_dir/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -41,6 +42,8 @@ cat > "$contents_dir/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key>
   <string>Toma</string>
   <key>CFBundleExecutable</key>
+  <string>Toma</string>
+  <key>CFBundleIconFile</key>
   <string>Toma</string>
   <key>CFBundleIdentifier</key>
   <string>dev.toma.app</string>
