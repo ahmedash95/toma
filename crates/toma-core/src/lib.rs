@@ -213,22 +213,40 @@ impl TomaCore {
         let mut events = vec![AppEvent::MessagePosted {
             message_id: message.id,
         }];
-        let agent_ids = unique_agent_targets(&targets);
-        if agent_ids.is_empty() {
-            return Ok(events);
-        }
-
+        let mut agent_ids = unique_agent_targets(&targets);
         if let Some(thread_id) = thread_id {
-            for agent_id in agent_ids {
-                events.extend(self.attach_agent_with_prompt(
-                    workspace_id,
-                    thread_id,
-                    agent_id,
-                    &message.body,
-                    false,
-                )?);
+            // A plain reply in a thread goes to every agent already working in it.
+            let sessions: Vec<(AgentId, SessionId)> = {
+                let state = self.state()?;
+                let snapshot = state.snapshots.get(&workspace_id).expect("validated");
+                snapshot
+                    .sessions
+                    .iter()
+                    .filter(|session| session.thread_id == thread_id)
+                    .map(|session| (session.agent_id, session.id))
+                    .collect()
+            };
+            if agent_ids.is_empty() {
+                agent_ids = sessions.iter().map(|(agent_id, _)| *agent_id).collect();
             }
-        } else {
+            for agent_id in agent_ids {
+                match sessions.iter().find(|(id, _)| *id == agent_id) {
+                    Some((_, session_id)) => events.extend(self.continue_session(
+                        workspace_id,
+                        thread_id,
+                        *session_id,
+                        &message.body,
+                    )?),
+                    None => events.extend(self.attach_agent_with_prompt(
+                        workspace_id,
+                        thread_id,
+                        agent_id,
+                        &message.body,
+                        false,
+                    )?),
+                }
+            }
+        } else if !agent_ids.is_empty() {
             let created = self.create_thread(workspace_id, &message, agent_ids[0])?;
             events.extend(created.events);
             self.execute_run(
@@ -330,6 +348,56 @@ impl TomaCore {
             workspace_id,
             thread_id,
             session.id,
+            run.id,
+            prompt,
+            &mut events,
+        )?;
+        Ok(events)
+    }
+
+    /// Starts the next run of an existing session, which resumes the provider's conversation.
+    fn continue_session(
+        &self,
+        workspace_id: WorkspaceId,
+        thread_id: ThreadId,
+        session_id: SessionId,
+        prompt: &str,
+    ) -> Result<Vec<AppEvent>, CoreError> {
+        let sequence = {
+            let state = self.state()?;
+            let snapshot = state.snapshots.get(&workspace_id).expect("validated");
+            snapshot
+                .runs
+                .iter()
+                .filter(|run| run.session_id == session_id)
+                .map(|run| run.sequence)
+                .max()
+                .unwrap_or(0)
+                + 1
+        };
+        let run = Run {
+            id: RunId::new(),
+            session_id,
+            sequence,
+            status: WorkStatus::Queued,
+            started_at: None,
+            finished_at: None,
+        };
+        self.store.insert_run(&run)?;
+        self.state()?
+            .snapshots
+            .get_mut(&workspace_id)
+            .expect("validated")
+            .runs
+            .push(run.clone());
+        let mut events = vec![AppEvent::RunCreated {
+            run_id: run.id,
+            session_id,
+        }];
+        self.execute_run(
+            workspace_id,
+            thread_id,
+            session_id,
             run.id,
             prompt,
             &mut events,

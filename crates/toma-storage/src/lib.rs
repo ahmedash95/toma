@@ -52,6 +52,7 @@ pub trait TomaStore: Send + Sync {
         run: &Run,
     ) -> StorageResult<()>;
     fn insert_session_bundle(&self, session: &AgentSession, run: &Run) -> StorageResult<()>;
+    fn insert_run(&self, run: &Run) -> StorageResult<()>;
     fn update_run_status(
         &self,
         run_id: RunId,
@@ -360,6 +361,14 @@ impl TomaStore for SqliteStore {
         let tx = connection.transaction()?;
         insert_thread_row(&tx, thread)?;
         insert_session_row(&tx, session)?;
+        insert_run_row(&tx, run)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn insert_run(&self, run: &Run) -> StorageResult<()> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction()?;
         insert_run_row(&tx, run)?;
         tx.commit()?;
         Ok(())

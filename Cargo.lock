@@ -5544,6 +5544,7 @@ dependencies = [
 name = "toma-core"
 version = "0.1.0"
 dependencies = [
+ "tempfile",
  "thiserror 2.0.21",
  "toma-domain",
  "toma-runner",

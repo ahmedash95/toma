@@ -1,6 +1,6 @@
 use gpui::{
-    Context, Entity, IntoElement, MouseButton, Render, Subscription, Window, div, prelude::*, px,
-    rgb,
+    Context, Entity, Focusable, IntoElement, MouseButton, Render, Subscription, Window, div,
+    prelude::*, px, rgb,
 };
 use std::{sync::Arc, time::Duration};
 use toma_core::TomaCore;
@@ -21,7 +21,7 @@ impl TomaShell {
     pub fn new(
         snapshot: WorkspaceSnapshot,
         backend: Option<(Arc<TomaCore>, WorkspaceId)>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut gpui::App,
     ) -> Entity<Self> {
         let model = ShellViewModel::new(snapshot);
@@ -45,6 +45,8 @@ impl TomaShell {
                 cx,
             )
         });
+
+        window.focus(&composer.focus_handle(cx));
 
         cx.new(|cx| {
             let subscription = cx.subscribe(&composer, |shell: &mut Self, _, event, cx| {

@@ -55,6 +55,11 @@ impl TomaStore for FakeStore {
         Ok(())
     }
 
+    fn insert_run(&self, run: &Run) -> StorageResult<()> {
+        self.snapshot.lock().unwrap().runs.push(run.clone());
+        Ok(())
+    }
+
     fn update_run_status(
         &self,
         run_id: RunId,
@@ -380,7 +385,7 @@ fn collaborator_gets_a_separate_session_and_run_on_the_same_worktree() {
 }
 
 #[test]
-fn plain_channel_and_thread_messages_do_not_create_agent_work() {
+fn plain_thread_reply_continues_the_existing_agent_session() {
     let fixture = fixture();
     let first_events = fixture
         .core
@@ -411,12 +416,18 @@ fn plain_channel_and_thread_messages_do_not_create_agent_work() {
         })
         .unwrap();
 
-    assert_eq!(events.len(), 1);
     assert!(matches!(events[0], AppEvent::MessagePosted { .. }));
-    assert_eq!(fixture.runner.requests.lock().unwrap().len(), 1);
+    let requests = fixture.runner.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1].1, requests[0].1,
+        "same session, so the provider resumes"
+    );
+    assert_eq!(requests[1].3, "Additional context");
     let snapshot = fixture.store.snapshot.lock().unwrap();
-    assert_eq!(snapshot.messages.len(), 2);
-    assert_eq!(snapshot.messages[1].thread_id, Some(thread_id));
+    assert_eq!(snapshot.sessions.len(), 1);
+    assert_eq!(snapshot.runs.len(), 2);
+    assert_eq!(snapshot.runs[1].sequence, 2);
 }
 
 #[test]

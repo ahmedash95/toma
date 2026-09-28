@@ -12,3 +12,6 @@ toma-runner.workspace = true
 toma-storage.workspace = true
 toma-worktree.workspace = true
 
+
+[dev-dependencies]
+tempfile.workspace = true
