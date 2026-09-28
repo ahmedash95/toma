@@ -92,7 +92,7 @@ fn claude_waits_for_the_person_through_the_bridge() {
     assert!(
         live.messages
             .iter()
-            .any(|m| m.body.starts_with("🚫 Denied **"))
+            .any(|m| m.body.starts_with("Denied **"))
     );
     assert_eq!(live.runs[0].status, WorkStatus::Completed);
     assert!(

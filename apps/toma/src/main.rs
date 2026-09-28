@@ -7,7 +7,16 @@ use toma_storage::SqliteStore;
 use toma_worktree::GitWorktreeManager;
 
 /// Usage: `toma [repository]`; defaults to the current directory.
-fn main() -> anyhow::Result<()> {
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("Error: {error:#}");
+        #[cfg(target_os = "macos")]
+        macos::show_alert(&format!("{error:#}"));
+        std::process::exit(1);
+    }
+}
+
+fn run() -> anyhow::Result<()> {
     // Claude launches this executable as the MCP server that asks the person for permission.
     if std::env::args_os()
         .nth(1)
@@ -16,10 +25,8 @@ fn main() -> anyhow::Result<()> {
         let socket = std::env::args_os().nth(2).context("missing socket path")?;
         return Ok(toma_runner::run_approval_bridge(socket.as_ref())?);
     }
-    let repository = match std::env::args_os().nth(1) {
-        Some(path) => PathBuf::from(path),
-        None => std::env::current_dir()?,
-    };
+
+    let repository = resolve_repository()?;
     let repository = repository
         .canonicalize()
         .with_context(|| format!("repository {} does not exist", repository.display()))?;
@@ -47,4 +54,52 @@ fn main() -> anyhow::Result<()> {
     let snapshot = core.recover(workspace_id)?;
     toma_ui::run_with_core(core, workspace_id, snapshot);
     Ok(())
+}
+
+fn resolve_repository() -> anyhow::Result<PathBuf> {
+    if let Some(path) = std::env::args_os().nth(1) {
+        return Ok(PathBuf::from(path));
+    }
+
+    let cwd = std::env::current_dir()?;
+    if cwd.join(".git").exists() {
+        return Ok(cwd);
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(path) = macos::choose_git_repository()? {
+        return Ok(path);
+    }
+
+    anyhow::bail!(
+        "no Git repository was selected; run `open Toma.app --args /path/to/repo` or pass a repository path"
+    )
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use std::{path::PathBuf, process::Command};
+
+    pub fn show_alert(message: &str) {
+        let message = message.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!(r#"display alert "Toma" message "{message}" as critical"#);
+        let _ = Command::new("osascript").args(["-e", &script]).status();
+    }
+
+    pub fn choose_git_repository() -> anyhow::Result<Option<PathBuf>> {
+        let output = Command::new("osascript")
+            .args([
+                "-e",
+                r#"POSIX path of (choose folder with prompt "Choose a Git repository for Toma")"#,
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let path = String::from_utf8(output.stdout)?.trim().to_string();
+        if path.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(PathBuf::from(path.trim_end_matches('/'))))
+    }
 }

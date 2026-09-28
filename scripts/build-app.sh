@@ -66,4 +66,6 @@ cat > "$contents_dir/Info.plist" <<PLIST
 PLIST
 
 echo "$app_dir"
+echo "Launch with a repository, for example:" >&2
+echo "  open \"$app_dir\" --args \"$(pwd)\"" >&2
 

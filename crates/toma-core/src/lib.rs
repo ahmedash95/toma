@@ -884,14 +884,14 @@ impl TomaCore {
             thread_id: Some(request.thread_id),
             author: MessageAuthor::System,
             body: match decision {
-                PermissionDecision::Deny => format!("🚫 Denied **{}**: `{detail}`", request.tool),
-                PermissionDecision::Allow => format!("✅ Allowed **{}**: `{detail}`", request.tool),
+                PermissionDecision::Deny => format!("Denied **{}**: `{detail}`", request.tool),
+                PermissionDecision::Allow => format!("Allowed **{}**: `{detail}`", request.tool),
                 PermissionDecision::AlwaysAllow => format!(
-                    "✅ Always allowed `{}` for this session: `{detail}`",
+                    "Always allowed `{}` for this session: `{detail}`",
                     request.rule
                 ),
                 PermissionDecision::SwitchToAuto => format!(
-                    "✅ Allowed **{}**: `{detail}`. This thread is now in ⚡ Auto mode.",
+                    "Allowed **{}**: `{detail}`. This thread is now in Auto mode.",
                     request.tool
                 ),
             },

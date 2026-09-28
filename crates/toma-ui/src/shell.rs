@@ -486,7 +486,7 @@ impl TomaShell {
                             .py_1()
                             .text_size(px(12.))
                             .text_color(theme.text_tertiary)
-                            .child("💬 Mention an agent to start one")
+                            .child("Mention an agent to start one")
                     }))
                     .children(threads.into_iter().enumerate().map(
                         |(index, (id, title, status, agents))| {
@@ -583,7 +583,7 @@ impl TomaShell {
                                 div()
                                     .text_size(px(20.))
                                     .font_weight(FontWeight::BOLD)
-                                    .child(format!("👋 Welcome to #{name}")),
+                                    .child(format!("Welcome to #{name}")),
                             )
                             .child(
                                 div()
@@ -801,7 +801,7 @@ impl TomaShell {
                                         .child(
                                             div()
                                                 .flex_shrink_0()
-                                                .child(status_label(thread.status)),
+                                                .child(status_badge(thread.status, theme)),
                                         )
                                         .children(stats_row(stats, theme)),
                                 ),
@@ -917,17 +917,17 @@ impl TomaShell {
         let modes = [
             (
                 PermissionMode::Ask,
-                "✋",
+                Icon::Hand,
                 "Ask before commands and edits outside the folder",
             ),
             (
                 PermissionMode::Auto,
-                "⚡",
+                Icon::Zap,
                 "The agent's own reviewer answers for you",
             ),
             (
                 PermissionMode::Plan,
-                "📋",
+                Icon::Plan,
                 "Read-only: plan and explain, no edits",
             ),
         ];
@@ -938,7 +938,7 @@ impl TomaShell {
             .gap(px(2.))
             .rounded(px(7.))
             .bg(theme.selection)
-            .children(modes.into_iter().map(|(mode, emoji, tip)| {
+            .children(modes.into_iter().map(|(mode, icon, tip)| {
                 let selected = mode == current;
                 let label = format!("{mode:?}");
                 div()
@@ -965,7 +965,12 @@ impl TomaShell {
                         });
                         cx.notify();
                     }))
-                    .child(format!("{emoji} {label}"))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(icon.view(if selected { theme.text } else { theme.text_secondary })
+                        .size(px(12.)))
+                    .child(label)
             }))
     }
 
@@ -1059,7 +1064,7 @@ impl TomaShell {
                     ))
                     .child(button(
                         SharedString::from(format!("auto-{}", request.id)),
-                        "⚡ Allow & switch to Auto",
+                        "Allow & switch to Auto",
                         &auto_focus,
                         ButtonStyle::Secondary,
                         theme,
@@ -1302,41 +1307,38 @@ fn typing_indicator(agents: &[&str], id: &str, theme: &Theme) -> AnyElement {
 }
 
 fn status_dot(status: WorkStatus, theme: &Theme) -> impl IntoElement {
-    let color = match status {
+    let color = status_color(status, theme);
+    div().size(px(7.)).flex_shrink_0().rounded_full().bg(color)
+}
+
+fn status_color(status: WorkStatus, theme: &Theme) -> Hsla {
+    match status {
         WorkStatus::Queued | WorkStatus::Cancelled => theme.gray,
         WorkStatus::Reading | WorkStatus::Working => theme.accent,
         WorkStatus::WaitingForInput | WorkStatus::Blocked => theme.orange,
         WorkStatus::Completed => theme.green,
         WorkStatus::Failed => theme.red,
-    };
-    div().size(px(7.)).flex_shrink_0().rounded_full().bg(color)
-}
-
-fn status_emoji(status: WorkStatus) -> &'static str {
-    match status {
-        WorkStatus::Queued => "⏳",
-        WorkStatus::Reading => "👀",
-        WorkStatus::Working => "⚡",
-        WorkStatus::WaitingForInput => "✋",
-        WorkStatus::Blocked => "🧱",
-        WorkStatus::Completed => "✅",
-        WorkStatus::Failed => "❌",
-        WorkStatus::Cancelled => "🚫",
     }
 }
 
-fn status_label(status: WorkStatus) -> String {
-    let label = match status {
-        WorkStatus::Queued => "Queued",
-        WorkStatus::Reading => "Reading",
-        WorkStatus::Working => "Working",
-        WorkStatus::WaitingForInput => "Waiting for you",
-        WorkStatus::Blocked => "Blocked",
-        WorkStatus::Completed => "Done",
-        WorkStatus::Failed => "Failed",
-        WorkStatus::Cancelled => "Cancelled",
+/// Status as a tinted icon and label, e.g. a green check and "Done".
+fn status_badge(status: WorkStatus, theme: &Theme) -> impl IntoElement {
+    let (icon, label) = match status {
+        WorkStatus::Queued => (Icon::Hourglass, "Queued"),
+        WorkStatus::Reading => (Icon::Eye, "Reading"),
+        WorkStatus::Working => (Icon::Zap, "Working"),
+        WorkStatus::WaitingForInput => (Icon::Hand, "Waiting for you"),
+        WorkStatus::Blocked => (Icon::Alert, "Blocked"),
+        WorkStatus::Completed => (Icon::CircleCheck, "Done"),
+        WorkStatus::Failed => (Icon::CircleX, "Failed"),
+        WorkStatus::Cancelled => (Icon::Ban, "Cancelled"),
     };
-    format!("{} {label}", status_emoji(status))
+    div()
+        .flex()
+        .items_center()
+        .gap(px(3.))
+        .child(icon.view(status_color(status, theme)).size(px(12.)))
+        .child(label)
 }
 
 /// Local wall-clock time, or the date for messages older than today.
