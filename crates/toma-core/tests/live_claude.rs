@@ -128,4 +128,15 @@ fn claude_works_inside_a_plain_folder_channel() {
     println!("reply: {reply:?}");
     assert!(reply.contains("breakfast-pancakes.txt"));
     assert!(snapshot.worktrees.is_empty(), "plain folders run in place");
+
+    // Edits used to be denied because the runner started Claude in dontAsk mode.
+    core.dispatch(AppCommand::PostMessage {
+        channel_id,
+        thread_id: Some(snapshot.threads[0].id),
+        body: "Create notes.txt here containing the word ok.".into(),
+        attachments: Vec::new(),
+    })
+    .unwrap();
+    let notes = std::fs::read_to_string(folder.path().join("notes.txt")).unwrap_or_default();
+    assert!(notes.contains("ok"), "notes.txt: {notes:?}");
 }

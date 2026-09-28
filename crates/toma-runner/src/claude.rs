@@ -33,8 +33,10 @@ impl ClaudeCodeRunner {
             OsString::from("stream-json"),
             OsString::from("--verbose"),
             OsString::from("--include-partial-messages"),
+            // Auto mode lets a safety classifier approve routine edits and commands; with
+            // no one to answer prompts, anything it would ask about is denied.
             OsString::from("--permission-mode"),
-            OsString::from("dontAsk"),
+            OsString::from("auto"),
             OsString::from("--permission-prompts"),
             OsString::from("none"),
         ];

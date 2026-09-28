@@ -120,6 +120,7 @@ fn claude_streams_lines_and_uses_noninteractive_resume_arguments() {
     assert!(arguments.contains("--print\n"));
     assert!(arguments.contains("--output-format\nstream-json\n"));
     assert!(arguments.contains("--permission-prompts\nnone\n"));
+    assert!(arguments.contains("--permission-mode\nauto\n"));
     assert!(arguments.contains("--resume\nsession-123\n"));
 }
 
