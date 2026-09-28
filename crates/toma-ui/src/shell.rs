@@ -423,7 +423,7 @@ impl TomaShell {
                                         .into()
                                 })
                                 .on_click(cx.listener(|this, _, _, cx| this.new_channel(cx)))
-                                .child(Icon::Plus.view().size(px(14.))),
+                                .child(Icon::Plus.view(theme.text_secondary).size(px(14.))),
                         ),
                     )
                     .children(channels.into_iter().enumerate().map(|(index, channel)| {
@@ -439,7 +439,7 @@ impl TomaShell {
                                 this.model.close_thread();
                                 this.select_channel(id, cx);
                             }))
-                            .child(icon.view().size(px(14.)).text_color(theme.text_secondary))
+                            .child(icon.view(theme.text_secondary).size(px(14.)))
                             .child(div().flex_grow().truncate().child(channel.name))
                     }))
                     .child(div().h(px(14.)))
@@ -548,9 +548,8 @@ impl TomaShell {
                             .gap_1()
                             .child(
                                 if is_folder { Icon::Folder } else { Icon::Hash }
-                                    .view()
-                                    .size(px(14.))
-                                    .text_color(theme.text_secondary),
+                                    .view(theme.text_secondary)
+                                    .size(px(14.)),
                             )
                             .child(
                                 div()
@@ -666,7 +665,7 @@ impl TomaShell {
                         .hover(|link| link.underline())
                         .on_click(cx.listener(move |this, _, _, cx| this.open_thread(id, cx)))
                         .children(agents.iter().map(|(name, color)| mini_avatar(name, *color)))
-                        .child(Icon::Replies.view().size(px(13.)))
+                        .child(Icon::Replies.view(theme.accent).size(px(13.)))
                         .child(match replies {
                             0 => "Open thread".to_owned(),
                             1 => "1 reply".to_owned(),
@@ -684,7 +683,7 @@ impl TomaShell {
                         .text_color(theme.orange)
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| this.open_thread(id, cx)))
-                        .child(Icon::Shield.view().size(px(13.)))
+                        .child(Icon::Shield.view(theme.orange).size(px(13.)))
                         .child("Needs your approval")
                 }))
                 .children(
@@ -811,7 +810,7 @@ impl TomaShell {
                                 .cursor_pointer()
                                 .hover(|button| button.bg(theme.hover))
                                 .on_click(cx.listener(|this, _, _, cx| this.close_thread(cx)))
-                                .child(Icon::Close.view().size(px(14.))),
+                                .child(Icon::Close.view(theme.text_secondary).size(px(14.))),
                         ),
                 )
                 .child(
@@ -980,7 +979,7 @@ impl TomaShell {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(Icon::Shield.view().size(px(15.)).text_color(theme.orange))
+                    .child(Icon::Shield.view(theme.orange).size(px(15.)))
                     .child(
                         div()
                             .font_weight(FontWeight::SEMIBOLD)
@@ -1227,7 +1226,7 @@ fn stats_row(stats: ThreadStats, theme: &Theme) -> Option<impl IntoElement> {
             .flex()
             .items_center()
             .gap(px(3.))
-            .child(icon.view().size(px(11.)))
+            .child(icon.view(theme.text_tertiary).size(px(11.)))
             .child(text)
     };
     Some(

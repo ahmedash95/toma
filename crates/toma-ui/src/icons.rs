@@ -1,4 +1,4 @@
-use gpui::{AssetSource, Result, SharedString, Styled, Svg, svg};
+use gpui::{AssetSource, Hsla, Result, SharedString, Styled, Svg, svg};
 use std::borrow::Cow;
 
 /// Line icons drawn on a 24px grid (Lucide style); GPUI tints them with the text color.
@@ -44,8 +44,9 @@ impl Icon {
         format!("icons/{}.svg", self as u8).into()
     }
 
-    pub fn view(self) -> Svg {
-        svg().path(self.path()).flex_none()
+    /// SVGs do not inherit the text color, so every icon states its own.
+    pub fn view(self, color: Hsla) -> Svg {
+        svg().path(self.path()).flex_none().text_color(color)
     }
 }
 
