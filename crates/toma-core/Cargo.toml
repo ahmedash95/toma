@@ -1,0 +1,14 @@
+[package]
+name = "toma-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+toma-domain.workspace = true
+toma-runner.workspace = true
+toma-storage.workspace = true
+toma-worktree.workspace = true
+

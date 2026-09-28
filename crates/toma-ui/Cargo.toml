@@ -1,0 +1,12 @@
+[package]
+name = "toma-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui.workspace = true
+toma-core.workspace = true
+toma-domain.workspace = true
+

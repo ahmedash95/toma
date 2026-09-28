@@ -1,0 +1,42 @@
+[workspace]
+members = [
+    "apps/toma",
+    "crates/toma-core",
+    "crates/toma-domain",
+    "crates/toma-runner",
+    "crates/toma-storage",
+    "crates/toma-ui",
+    "crates/toma-worktree",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+gpui = "0.2.2"
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tempfile = "3.23.0"
+thiserror = "2.0.17"
+uuid = { version = "1.18.1", features = ["serde", "v7"] }
+
+toma-core = { path = "crates/toma-core" }
+toma-domain = { path = "crates/toma-domain" }
+toma-runner = { path = "crates/toma-runner" }
+toma-storage = { path = "crates/toma-storage" }
+toma-ui = { path = "crates/toma-ui" }
+toma-worktree = { path = "crates/toma-worktree" }
+
+[profile.dev]
+debug = 1
+
+[profile.release]
+lto = "thin"
+strip = true
+
