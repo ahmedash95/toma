@@ -105,6 +105,24 @@ impl TomaStore for FakeStore {
         Ok(())
     }
 
+    fn raw_history(&self, run_id: RunId) -> StorageResult<Vec<toma_storage::RawHistoryEntry>> {
+        Ok(self
+            .history
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _, _)| *id == run_id)
+            .map(
+                |(run_id, sequence, payload)| toma_storage::RawHistoryEntry {
+                    run_id: *run_id,
+                    sequence: *sequence,
+                    payload: payload.clone(),
+                    created_at: *sequence,
+                },
+            )
+            .collect())
+    }
+
     fn set_provider_session_id(
         &self,
         session_id: SessionId,
@@ -681,6 +699,66 @@ fn agent_reply_becomes_a_thread_message_and_session_id_persists() {
     assert_eq!(
         snapshot.sessions[0].provider_session_id.as_deref(),
         Some("provider-1")
+    );
+}
+
+#[test]
+fn agent_reply_links_to_its_run_and_the_run_has_a_transcript() {
+    let fixture = fixture_with_events(vec![
+        RunnerEvent::Output(
+            r#"{"type":"item.completed","item":{"type":"command_execution","command":"ls","aggregated_output":"a.rs","exit_code":0}}"#
+                .into(),
+        ),
+        RunnerEvent::Output("not json".into()),
+        RunnerEvent::Reply("done".into()),
+        RunnerEvent::Failed("exit status 1".into()),
+    ]);
+    fixture
+        .core
+        .dispatch(AppCommand::PostMessage {
+            channel_id: fixture.channel_id,
+            thread_id: None,
+            body: "Build it".into(),
+            attachments: vec![AttachmentTarget::Agent {
+                agent_id: fixture.agent_id,
+            }],
+        })
+        .unwrap();
+
+    let run_id = fixture.store.snapshot.lock().unwrap().runs[0].id;
+    let reply = fixture
+        .store
+        .snapshot
+        .lock()
+        .unwrap()
+        .messages
+        .last()
+        .cloned()
+        .unwrap();
+    assert_eq!(reply.run_id, Some(run_id));
+    let steps: Vec<_> = fixture
+        .core
+        .run_transcript(run_id)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.step)
+        .collect();
+    assert_eq!(
+        steps,
+        vec![
+            TranscriptStep::ToolCall {
+                name: "Shell".into(),
+                summary: "ls".into(),
+                input: "ls".into(),
+            },
+            TranscriptStep::ToolResult {
+                output: "a.rs".into(),
+                is_error: false,
+            },
+            TranscriptStep::Error {
+                text: "exit status 1".into(),
+            },
+        ]
     );
 }
 

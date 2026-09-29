@@ -1,10 +1,11 @@
 use crate::approval::{self, ApprovalListener, Pending};
 use crate::process::{CommandSpec, ProcessRunner};
+use crate::transcript::{Transcript, pretty, tool_summary};
 use crate::{AgentRunner, RunRequest, RunnerCapabilities, RunnerError, RunnerEvent, translate};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use toma_domain::{PermissionDecision, PermissionMode, RunId, RunnerProvider};
+use toma_domain::{PermissionDecision, PermissionMode, RunId, RunnerProvider, TranscriptStep};
 
 #[derive(Clone)]
 pub struct ClaudeCodeRunner {
@@ -146,6 +147,67 @@ fn claude_event(line: &serde_json::Value) -> Option<RunnerEvent> {
     }
 }
 
+/// Adds the steps in a stream-json line. Reads the complete `assistant` and `user`
+/// messages; the `stream_event` partials repeat them.
+pub(crate) fn transcript_line(transcript: &mut Transcript, line: &serde_json::Value) {
+    transcript.set_subagent(!line["parent_tool_use_id"].is_null());
+    let blocks = line["message"]["content"].as_array().map(Vec::as_slice);
+    match line["type"].as_str() {
+        Some("assistant") => {
+            for block in blocks.unwrap_or_default() {
+                let text = |key: &str| block[key].as_str().unwrap_or_default().to_owned();
+                match block["type"].as_str() {
+                    // Usually empty: Claude often keeps its thinking to itself.
+                    Some("thinking") => transcript.push(TranscriptStep::Thinking {
+                        text: text("thinking"),
+                    }),
+                    Some("text") => transcript.push(TranscriptStep::Text { text: text("text") }),
+                    Some("tool_use") => transcript.push(TranscriptStep::ToolCall {
+                        name: text("name"),
+                        summary: tool_summary(&block["input"]),
+                        input: pretty(&block["input"]),
+                    }),
+                    _ => {}
+                }
+            }
+        }
+        Some("user") => {
+            for block in blocks.unwrap_or_default() {
+                if block["type"] == "tool_result" {
+                    transcript.push(TranscriptStep::ToolResult {
+                        output: tool_result_text(&block["content"]),
+                        is_error: block["is_error"].as_bool().unwrap_or(false),
+                    });
+                }
+            }
+        }
+        Some("result") if line["is_error"] == true => transcript.push(TranscriptStep::Error {
+            text: line["result"]
+                .as_str()
+                .or(line["subtype"].as_str())
+                .unwrap_or("The run failed")
+                .to_owned(),
+        }),
+        _ => {}
+    }
+}
+
+/// A tool result is plain text or a list of content blocks.
+fn tool_result_text(content: &serde_json::Value) -> String {
+    match content.as_array() {
+        Some(blocks) => blocks
+            .iter()
+            .map(|block| match block["type"].as_str() {
+                Some("text") => block["text"].as_str().unwrap_or_default().to_owned(),
+                Some(kind) => format!("[{kind}]"),
+                None => pretty(block),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None => pretty(content),
+    }
+}
+
 impl Default for ClaudeCodeRunner {
     fn default() -> Self {
         Self::new()
@@ -211,5 +273,93 @@ impl AgentRunner for ClaudeCodeRunner {
         answer
             .send(decision)
             .map_err(|_| RunnerError::Protocol("the run stopped waiting".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use toma_domain::TranscriptEntry;
+
+    fn steps(lines: &[&str]) -> Vec<TranscriptEntry> {
+        let mut transcript = Transcript::new(RunnerProvider::ClaudeCodeCli);
+        for (at, line) in lines.iter().enumerate() {
+            assert!(transcript.line(line, at as i64));
+        }
+        transcript.finish()
+    }
+
+    #[test]
+    fn transcript_has_thinking_tool_calls_results_and_text() {
+        let entries = steps(&[
+            r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Let"}}}"#,
+            r#"{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"thinking","thinking":"Check the tree.","signature":"x"}]}}"#,
+            r#"{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"thinking","thinking":"","signature":"x"}]}}"#,
+            r#"{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls","description":"List"}}]}}"#,
+            r#"{"type":"user","parent_tool_use_id":null,"message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"a.rs\nb.rs","is_error":false}]}}"#,
+            r#"{"type":"user","parent_tool_use_id":"t2","message":{"content":[{"type":"tool_result","tool_use_id":"t3","content":[{"type":"text","text":"nope"}],"is_error":true}]}}"#,
+            r#"{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"Two files."}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"Two files."}"#,
+        ]);
+        let steps: Vec<_> = entries
+            .iter()
+            .map(|e| (e.at, e.subagent, e.step.clone()))
+            .collect();
+        assert_eq!(
+            steps,
+            vec![
+                (
+                    2,
+                    false,
+                    TranscriptStep::Thinking {
+                        text: "Check the tree.".into()
+                    }
+                ),
+                (
+                    4,
+                    false,
+                    TranscriptStep::ToolCall {
+                        name: "Bash".into(),
+                        summary: "ls".into(),
+                        input: "{\n  \"command\": \"ls\",\n  \"description\": \"List\"\n}".into(),
+                    }
+                ),
+                (
+                    5,
+                    false,
+                    TranscriptStep::ToolResult {
+                        output: "a.rs\nb.rs".into(),
+                        is_error: false
+                    }
+                ),
+                (
+                    6,
+                    true,
+                    TranscriptStep::ToolResult {
+                        output: "nope".into(),
+                        is_error: true
+                    }
+                ),
+                (
+                    7,
+                    false,
+                    TranscriptStep::Text {
+                        text: "Two files.".into()
+                    }
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_result_is_an_error_step() {
+        let entries = steps(&[r#"{"type":"result","subtype":"error_max_turns","is_error":true}"#]);
+        assert_eq!(
+            entries[0].step,
+            TranscriptStep::Error {
+                text: "error_max_turns".into()
+            }
+        );
     }
 }

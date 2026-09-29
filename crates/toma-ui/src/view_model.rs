@@ -123,33 +123,53 @@ impl ShellViewModel {
     /// provider does not report a duration.
     pub fn thread_stats(&self, thread_id: ThreadId) -> ThreadStats {
         let mut stats = ThreadStats::default();
-        for session in self
-            .snapshot
-            .sessions
-            .iter()
-            .filter(|s| s.thread_id == thread_id)
-        {
-            for run in self
-                .snapshot
-                .runs
+        for run in self.snapshot.runs.iter().filter(|run| {
+            self.snapshot
+                .sessions
                 .iter()
-                .filter(|r| r.session_id == session.id)
-            {
-                stats.runs += 1;
-                let usage = self.snapshot.usages.iter().find(|u| u.run_id == run.id);
-                if let Some(usage) = usage {
-                    stats.tokens += usage.input_tokens + usage.output_tokens;
-                    if let Some(cost) = usage.cost_micros {
-                        *stats.cost_micros.get_or_insert(0) += cost;
-                    }
-                }
-                stats.duration_ms += usage
-                    .and_then(|u| u.duration_ms)
-                    .or_else(|| Some(run.finished_at? - run.started_at?))
-                    .unwrap_or(0);
-            }
+                .any(|s| s.id == run.session_id && s.thread_id == thread_id)
+        }) {
+            self.add_run_stats(&mut stats, run);
         }
         stats
+    }
+
+    /// What a single run consumed.
+    pub fn run_stats(&self, run_id: RunId) -> ThreadStats {
+        let mut stats = ThreadStats::default();
+        if let Some(run) = self.run(run_id) {
+            self.add_run_stats(&mut stats, run);
+        }
+        stats
+    }
+
+    fn add_run_stats(&self, stats: &mut ThreadStats, run: &Run) {
+        stats.runs += 1;
+        let usage = self.snapshot.usages.iter().find(|u| u.run_id == run.id);
+        if let Some(usage) = usage {
+            stats.tokens += usage.input_tokens + usage.output_tokens;
+            if let Some(cost) = usage.cost_micros {
+                *stats.cost_micros.get_or_insert(0) += cost;
+            }
+        }
+        stats.duration_ms += usage
+            .and_then(|u| u.duration_ms)
+            .or_else(|| Some(run.finished_at? - run.started_at?))
+            .unwrap_or(0);
+    }
+
+    pub fn run(&self, run_id: RunId) -> Option<&Run> {
+        self.snapshot.runs.iter().find(|run| run.id == run_id)
+    }
+
+    /// The agent whose session `run_id` belongs to.
+    pub fn run_agent(&self, run_id: RunId) -> Option<AgentId> {
+        let run = self.run(run_id)?;
+        self.snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == run.session_id)
+            .map(|session| session.agent_id)
     }
 
     /// Names of agents with a run still in progress in `thread_id`.
