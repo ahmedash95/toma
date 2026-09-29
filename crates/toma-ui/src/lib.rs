@@ -4,6 +4,7 @@ mod controls;
 mod icons;
 mod inspector;
 mod markdown;
+mod palette;
 mod selectable;
 mod shell;
 mod theme;
@@ -45,6 +46,7 @@ fn open(snapshot: WorkspaceSnapshot, backend: Option<(Arc<TomaCore>, WorkspaceId
             bind_keys(cx);
             controls::bind_keys(cx);
             inspector::bind_keys(cx);
+            palette::bind_keys(cx);
             let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
             cx.open_window(
                 WindowOptions {
@@ -76,6 +78,63 @@ fn sample_snapshot() -> WorkspaceSnapshot {
     let person_id = PersonId::new();
     let general_id = ChannelId::new();
     let shipping_id = ChannelId::new();
+    let research_id = ChannelId::new();
+    let design_id = ChannelId::new();
+    // Extra threads so the ⌘K palette has something to search: (channel, title, status, updated).
+    let extra_threads = [
+        (
+            shipping_id,
+            "Release notes for 0.3",
+            WorkStatus::Completed,
+            7,
+        ),
+        (
+            shipping_id,
+            "Homebrew cask bump",
+            WorkStatus::WaitingForInput,
+            9,
+        ),
+        (
+            research_id,
+            "Compare GPUI text input options",
+            WorkStatus::Completed,
+            5,
+        ),
+        (
+            research_id,
+            "Investigate SQLite WAL checkpoints",
+            WorkStatus::Failed,
+            6,
+        ),
+        (design_id, "Command palette layout", WorkStatus::Working, 10),
+        (
+            design_id,
+            "Dark mode sidebar contrast",
+            WorkStatus::Queued,
+            8,
+        ),
+    ]
+    .map(|(channel_id, title, status, updated_at)| {
+        let root = Message {
+            id: MessageId::new(),
+            channel_id,
+            thread_id: None,
+            author: MessageAuthor::Person(person_id),
+            body: format!("@Builder {title}"),
+            created_at: updated_at,
+        };
+        let thread = TaskThread {
+            id: ThreadId::new(),
+            channel_id,
+            root_message_id: root.id,
+            title: title.into(),
+            status,
+            created_at: updated_at,
+            updated_at,
+            permission_mode: PermissionMode::Ask,
+        };
+        (root, thread)
+    });
     let thread_id = ThreadId::new();
     let root_id = MessageId::new();
     let builder_id = AgentId::new();
@@ -94,8 +153,8 @@ fn sample_snapshot() -> WorkspaceSnapshot {
         channels: vec![
             Channel { id: general_id, workspace_id, name: "general".into(), position: 0, repository_path: None },
             Channel { id: shipping_id, workspace_id, name: "shipping".into(), position: 1, repository_path: None },
-            Channel { id: ChannelId::new(), workspace_id, name: "research".into(), position: 2, repository_path: None },
-            Channel { id: ChannelId::new(), workspace_id, name: "design-review".into(), position: 3, repository_path: None },
+            Channel { id: research_id, workspace_id, name: "research".into(), position: 2, repository_path: None },
+            Channel { id: design_id, workspace_id, name: "design-review".into(), position: 3, repository_path: None },
         ],
         people: vec![Person { id: person_id, workspace_id, display_name: "Ahmed".into() }],
         agents: vec![
@@ -109,8 +168,13 @@ fn sample_snapshot() -> WorkspaceSnapshot {
             Message { id: MessageId::new(), channel_id: general_id, thread_id: None, author: MessageAuthor::Agent(reviewer_id), body: "Reviewing keyboard behavior and empty-state edges now. One thread needs your input before it can continue.".into(), created_at: 3 },
             Message { id: MessageId::new(), channel_id: general_id, thread_id: Some(thread_id), author: MessageAuthor::Agent(builder_id), body: "The main pane and thread context stay independent, including their drafts.".into(), created_at: 4 },
             Message { id: MessageId::new(), channel_id: shipping_id, thread_id: None, author: MessageAuthor::Person(person_id), body: "Prepare the release notes once the shell is ready.".into(), created_at: 5 },
-        ],
-        threads: vec![TaskThread { id: thread_id, channel_id: general_id, root_message_id: root_id, title: "Native shell polish".into(), status: WorkStatus::Working, created_at: 1, updated_at: 4, permission_mode: PermissionMode::Ask }],
+        ]
+        .into_iter()
+        .chain(extra_threads.iter().map(|(root, _)| root.clone()))
+        .collect(),
+        threads: std::iter::once(TaskThread { id: thread_id, channel_id: general_id, root_message_id: root_id, title: "Native shell polish".into(), status: WorkStatus::Working, created_at: 1, updated_at: 4, permission_mode: PermissionMode::Ask })
+            .chain(extra_threads.iter().map(|(_, thread)| thread.clone()))
+            .collect(),
         sessions: vec![
             AgentSession { id: builder_session, thread_id, agent_id: builder_id, provider_session_id: None, status: WorkStatus::Working, created_at: 1 },
             AgentSession { id: reviewer_session, thread_id, agent_id: reviewer_id, provider_session_id: None, status: WorkStatus::WaitingForInput, created_at: 2 },
