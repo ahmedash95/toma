@@ -19,7 +19,7 @@ use toma_storage::WorkspaceSnapshot;
 use crate::Theme;
 use crate::browser::{Browser, BrowserEvent, normalize_address, opens_in_app};
 use crate::composer::{Composer, ComposerEvent, MentionCandidate};
-use crate::controls::{ButtonStyle, Cancel, OnPress, button, focus_navigation};
+use crate::controls::{ButtonStyle, Cancel, OnPress, button, focus_navigation, scroll_x};
 use crate::icons::Icon;
 use crate::inspector::{Inspector, Tab, TabContent, TabId, ToggleInspector};
 use crate::markdown::{OnLink, render_markdown};
@@ -1539,7 +1539,9 @@ impl Render for TomaShell {
             inspector.sync_visibility(Some(*thread) == active);
         }
         let inspector = self.inspector(window, &theme, cx);
-        focus_navigation(div())
+        // When the panes' minimum widths don't fit the window, scroll to them instead of
+        // clipping the thread and inspector off the right edge.
+        scroll_x(focus_navigation(div()).id("panes"))
             .size_full()
             .flex()
             .font_family(".SystemUIFont")

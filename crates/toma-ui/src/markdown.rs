@@ -16,8 +16,12 @@ use crate::zoom::px;
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::Theme;
+use crate::controls::scroll_x;
 use crate::icons::Icon;
 use crate::selectable::Doc;
+
+/// Narrowest a table column gets before the table scrolls sideways instead.
+const TABLE_COLUMN_MIN: f32 = 96.;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Style {
@@ -352,19 +356,25 @@ fn block(doc: &Doc, id: ElementId, b: &Block, t: &Theme, color: Hsla) -> AnyElem
         }
         Block::CodeBlock { text, .. } => {
             let code = text.trim_end_matches('\n').to_string();
+            // Lines keep their shape and scroll sideways; the copy button stays put.
             div()
                 .group("code")
                 .relative()
                 .w_full()
                 .min_w(px(0.))
-                .p(px(8.))
-                .pr(px(32.))
                 .rounded(px(6.))
                 .bg(t.code_bg)
                 .font_family("Menlo")
                 .text_size(px(12.))
                 .line_height(px(18.))
-                .child(doc.leaf(code.clone(), None, Vec::new()))
+                .child(
+                    scroll_x(div().id(sub(&id, 1)))
+                        .w_full()
+                        .p(px(8.))
+                        .pr(px(32.))
+                        .whitespace_nowrap()
+                        .child(doc.leaf(code.clone(), None, Vec::new())),
+                )
                 .child(copy_button(sub(&id, 0), code, t))
                 .into_any_element()
         }
@@ -423,30 +433,38 @@ fn block(doc: &Doc, id: ElementId, b: &Block, t: &Theme, color: Hsla) -> AnyElem
             .my(px(4.))
             .bg(t.separator)
             .into_any_element(),
-        Block::Table { rows } => div()
+        // Columns keep a readable width; a table wider than the pane scrolls sideways.
+        Block::Table { rows } => scroll_x(div().id(id.clone()))
             .w_full()
             .min_w(px(0.))
-            .border_1()
-            .border_color(t.separator)
-            .children(rows.iter().enumerate().map(|(r, row)| {
-                let weight = if r == 0 {
-                    FontWeight::SEMIBOLD
-                } else {
-                    FontWeight::NORMAL
-                };
-                let mut line = div().flex().flex_row().border_color(t.separator);
-                if r + 1 < rows.len() {
-                    line = line.border_b_1();
-                }
-                line.children(row.iter().map(|cell| {
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .px(px(6.))
-                        .py(px(3.))
-                        .child(text(doc, cell, t, color, weight))
-                }))
-            }))
+            .child(
+                div()
+                    .w_full()
+                    .min_w(px(
+                        TABLE_COLUMN_MIN * rows.iter().map(Vec::len).max().unwrap_or(0) as f32
+                    ))
+                    .border_1()
+                    .border_color(t.separator)
+                    .children(rows.iter().enumerate().map(|(r, row)| {
+                        let weight = if r == 0 {
+                            FontWeight::SEMIBOLD
+                        } else {
+                            FontWeight::NORMAL
+                        };
+                        let mut line = div().flex().flex_row().border_color(t.separator);
+                        if r + 1 < rows.len() {
+                            line = line.border_b_1();
+                        }
+                        line.children(row.iter().map(|cell| {
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .px(px(6.))
+                                .py(px(3.))
+                                .child(text(doc, cell, t, color, weight))
+                        }))
+                    })),
+            )
             .into_any_element(),
     }
 }

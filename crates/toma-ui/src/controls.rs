@@ -32,6 +32,14 @@ pub fn focus_navigation<E: InteractiveElement>(element: E) -> E {
         .on_action(|_: &FocusPrevious, window, _| window.focus_prev())
 }
 
+/// Scrolls sideways when the content is wider than the element. The vertical wheel is left
+/// to the scrolling list around it instead of being turned into horizontal scroll.
+pub fn scroll_x(element: Stateful<Div>) -> Stateful<Div> {
+    let mut element = element.overflow_x_scroll();
+    element.style().restrict_scroll_to_axis = Some(true);
+    element
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum ButtonStyle {
     Primary,
