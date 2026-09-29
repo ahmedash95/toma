@@ -5,6 +5,7 @@ use gpui::{
 };
 
 use crate::zoom::px;
+use futures::{StreamExt, channel::mpsc::UnboundedSender};
 use std::{
     collections::{HashMap, HashSet},
     rc::Rc,
@@ -16,15 +17,26 @@ use toma_domain::*;
 use toma_storage::WorkspaceSnapshot;
 
 use crate::Theme;
+use crate::browser::{Browser, BrowserEvent, normalize_address, opens_in_app};
 use crate::composer::{Composer, ComposerEvent, MentionCandidate};
 use crate::controls::{ButtonStyle, Cancel, OnPress, button, focus_navigation};
 use crate::icons::Icon;
-use crate::markdown::render_markdown;
+use crate::inspector::{Inspector, Tab, TabContent, TabId, ToggleInspector};
+use crate::markdown::{OnLink, render_markdown};
 use crate::view_model::{ContextKey, ShellViewModel, ThreadStats};
 
 /// Height of the unified title bar strip; the traffic lights sit inside it.
 const TITLEBAR: f32 = 52.;
 const THREAD_WIDTH: (f32, f32) = (300., 900.);
+const SIDEBAR_WIDTH: f32 = 240.;
+const CONVERSATION_MIN: f32 = 360.;
+const INSPECTOR_MIN: f32 = 320.;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Divider {
+    Thread,
+    Inspector,
+}
 
 pub struct TomaShell {
     model: ShellViewModel,
@@ -35,7 +47,12 @@ pub struct TomaShell {
     thread_scroll: ScrollHandle,
     seen_messages: usize,
     thread_width: f32,
-    resizing_thread: bool,
+    /// Shared by every thread's inspector, like the thread pane width.
+    inspector_width: f32,
+    resizing: Option<Divider>,
+    /// Each thread's inspector tabs, kept alive while other threads are shown.
+    inspectors: HashMap<ThreadId, Inspector>,
+    browser_events: UnboundedSender<BrowserEvent>,
     /// Focus to move to on the next frame, once the target element exists.
     pending_focus: Option<FocusHandle>,
     /// Deny, Allow, Always allow, Switch to Auto buttons of each pending permission request.
@@ -78,6 +95,20 @@ impl TomaShell {
         window.focus(&channel_composer.focus_handle(cx));
 
         cx.new(|cx| {
+            let (browser_events, mut events) = futures::channel::mpsc::unbounded();
+            cx.spawn_in(window, async move |this: gpui::WeakEntity<Self>, cx| {
+                while let Some(event) = events.next().await {
+                    if this
+                        .update_in(cx, |shell, window, cx| {
+                            shell.browser_event(event, window, cx)
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .detach();
             let subscriptions = vec![
                 cx.subscribe(&channel_composer, |shell: &mut Self, _, event, cx| {
                     let key = shell.channel_key();
@@ -129,7 +160,10 @@ impl TomaShell {
                 channel_scroll: ScrollHandle::new(),
                 thread_scroll: ScrollHandle::new(),
                 thread_width: 400.,
-                resizing_thread: false,
+                inspector_width: 560.,
+                resizing: None,
+                inspectors: HashMap::new(),
+                browser_events,
                 pending_focus: None,
                 request_buttons: HashMap::new(),
                 focused_requests: HashSet::new(),
@@ -307,6 +341,388 @@ impl TomaShell {
         cx.notify();
     }
 
+    /// Links open in a tab of the thread they appear in; Cmd-click, links outside a thread,
+    /// and non-web links go to the system browser.
+    fn link_handler(&self, thread: Option<ThreadId>, cx: &Context<Self>) -> OnLink {
+        let shell = cx.entity().downgrade();
+        Rc::new(move |url, window, cx| {
+            let thread = thread.filter(|_| opens_in_app(url) && !window.modifiers().platform);
+            let Some(thread) = thread else {
+                return cx.open_url(url);
+            };
+            let _ = shell.update(cx, |shell, cx| {
+                if shell.model.open_thread_id() != Some(thread) {
+                    shell.open_thread(thread, cx);
+                }
+                shell.open_page(thread, url, window, cx);
+            });
+        })
+    }
+
+    /// Shows `url` in the thread's inspector: the tab already on it, else a new tab.
+    fn open_page(
+        &mut self,
+        thread: ThreadId,
+        url: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let inspector = self.inspectors.entry(thread).or_default();
+        match inspector.find_page(url) {
+            Some(tab) => inspector.select(tab),
+            None => self.new_browser_tab(thread, Some(url), window, cx),
+        }
+        cx.notify();
+    }
+
+    /// Adds a browser tab with its own page and history; without a URL it starts blank with
+    /// the address bar focused.
+    fn new_browser_tab(
+        &mut self,
+        thread: ThreadId,
+        url: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tab = TabId::next();
+        let events = self.browser_events.clone();
+        let browser = match Browser::new(tab, url.unwrap_or("about:blank"), events, window, cx) {
+            Ok(browser) => browser,
+            Err(error) => {
+                eprintln!("toma: could not create the in-app browser: {error}");
+                if let Some(url) = url {
+                    cx.open_url(url);
+                }
+                return;
+            }
+        };
+        if url.is_none() {
+            self.pending_focus = Some(browser.address.focus_handle(cx));
+        }
+        let address = cx.subscribe(
+            &browser.address,
+            move |shell: &mut Self, _, event: &ComposerEvent, cx| {
+                if let ComposerEvent::Submitted(input) = event
+                    && let Some(browser) = shell.browser_mut(tab)
+                {
+                    match normalize_address(input) {
+                        Some(url) => browser.load(&url, cx),
+                        None => browser.set_url(&browser.url.clone(), cx),
+                    }
+                    cx.notify();
+                }
+            },
+        );
+        self.inspectors.entry(thread).or_default().add(Tab {
+            id: tab,
+            content: TabContent::Browser(browser),
+            _subscriptions: vec![address],
+        });
+        cx.notify();
+    }
+
+    fn browser_mut(&mut self, tab: TabId) -> Option<&mut Browser> {
+        self.inspectors
+            .values_mut()
+            .find_map(|inspector| inspector.tab_mut(tab))
+            .and_then(Tab::browser_mut)
+    }
+
+    fn thread_of_tab(&self, tab: TabId) -> Option<ThreadId> {
+        self.inspectors
+            .iter()
+            .find(|(_, inspector)| inspector.tabs.iter().any(|t| t.id == tab))
+            .map(|(thread, _)| *thread)
+    }
+
+    /// Shows or hides the open thread's inspector; an empty one starts with a blank tab.
+    fn toggle_inspector(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread) = self.model.open_thread_id() else {
+            return;
+        };
+        let inspector = self.inspectors.entry(thread).or_default();
+        if inspector.open {
+            inspector.open = false;
+        } else if inspector.tabs.is_empty() {
+            self.new_browser_tab(thread, None, window, cx);
+        } else {
+            inspector.open = true;
+        }
+        cx.notify();
+    }
+
+    fn open_inspector(&self) -> Option<&Inspector> {
+        self.inspectors
+            .get(&self.model.open_thread_id()?)
+            .filter(|inspector| inspector.open)
+    }
+
+    fn open_inspector_mut(&mut self) -> Option<&mut Inspector> {
+        self.inspectors
+            .get_mut(&self.model.open_thread_id()?)
+            .filter(|inspector| inspector.open)
+    }
+
+    fn active_browser(&self) -> Option<&Browser> {
+        self.open_inspector()?.active_tab()?.browser()
+    }
+
+    fn browser_event(&mut self, event: BrowserEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match event {
+            BrowserEvent::Loading { tab, url, loading } => {
+                if let Some(browser) = self.browser_mut(tab) {
+                    browser.loading = loading;
+                    if browser.url != url {
+                        browser.set_url(&url, cx);
+                    }
+                }
+            }
+            BrowserEvent::Title { tab, title } => {
+                if let Some(browser) = self.browser_mut(tab) {
+                    browser.title = title;
+                }
+            }
+            BrowserEvent::NewTab { tab, url } => match self.thread_of_tab(tab) {
+                Some(thread) if opens_in_app(&url) => {
+                    self.new_browser_tab(thread, Some(&url), window, cx)
+                }
+                _ => cx.open_url(&url),
+            },
+        }
+        cx.notify();
+    }
+
+    /// Width the inspector gets this frame: the preferred width, limited so the conversation
+    /// keeps its minimum.
+    fn inspector_room(&self, window: &Window) -> f32 {
+        let viewport = window.viewport_size().width / gpui::px(1.) / crate::zoom::zoom();
+        let room = viewport - SIDEBAR_WIDTH - CONVERSATION_MIN - self.thread_width;
+        self.inspector_width.min(room).max(INSPECTOR_MIN)
+    }
+
+    /// The panel docked beside the thread: a tab strip, the active tab's toolbar, its content.
+    fn inspector(
+        &self,
+        window: &Window,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let inspector = self.open_inspector()?;
+        let active = inspector.active_tab()?;
+        let tabs: Vec<_> = inspector
+            .tabs
+            .iter()
+            .map(|tab| self.inspector_tab(tab, tab.id == active.id, theme, cx))
+            .collect();
+        let (toolbar, body) = match &active.content {
+            TabContent::Browser(browser) => (
+                self.browser_toolbar(browser, theme, cx).into_any_element(),
+                browser.view().into_any_element(),
+            ),
+        };
+        let loading = active.browser().is_some_and(|browser| browser.loading);
+        Some(
+            div()
+                .relative()
+                .w(px(self.inspector_room(window)))
+                .h_full()
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .bg(theme.content_bg)
+                .border_l_1()
+                .border_color(theme.separator)
+                .child(
+                    titlebar_drag_area()
+                        .h(px(TITLEBAR))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .border_b_1()
+                        .border_color(theme.separator)
+                        .child(
+                            div()
+                                .min_w(px(0.))
+                                .flex_grow()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .overflow_hidden()
+                                .children(tabs),
+                        )
+                        .child(
+                            icon_button("inspector-new-tab", Icon::Plus, theme)
+                                .tooltip(|_, cx| cx.new(|_| Tooltip("New tab".into())).into())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    if let Some(thread) = this.model.open_thread_id() {
+                                        this.new_browser_tab(thread, None, window, cx);
+                                    }
+                                })),
+                        )
+                        .child(
+                            icon_button("inspector-hide", Icon::PanelRightClose, theme)
+                                .tooltip(|_, cx| {
+                                    cx.new(|_| Tooltip("Hide inspector  ⇧⌘B".into())).into()
+                                })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_inspector(window, cx)
+                                })),
+                        ),
+                )
+                .child(toolbar)
+                // A thin progress line while the page loads.
+                .child(
+                    div()
+                        .h(px(2.))
+                        .flex_shrink_0()
+                        .when(loading, |line| line.bg(theme.accent)),
+                )
+                .child(div().flex_grow().min_h(px(0.)).flex().child(body))
+                .child(self.divider("inspector-divider", Divider::Inspector, theme, cx))
+                .into_any_element(),
+        )
+    }
+
+    fn inspector_tab(
+        &self,
+        tab: &Tab,
+        active: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = tab.id;
+        div()
+            .id(SharedString::from(format!("inspector-{id:?}")))
+            .flex_1()
+            .min_w(px(56.))
+            .max_w(px(200.))
+            .h(px(28.))
+            .flex()
+            .items_center()
+            .gap_1()
+            .pl_2()
+            .pr_1()
+            .rounded(px(6.))
+            .cursor_pointer()
+            .text_size(px(12.))
+            .text_color(if active {
+                theme.text
+            } else {
+                theme.text_secondary
+            })
+            .when(active, |tab| tab.bg(theme.selection))
+            .when(!active, |tab| tab.hover(|tab| tab.bg(theme.hover)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(inspector) = this.open_inspector_mut() {
+                    inspector.select(id);
+                }
+                cx.notify();
+            }))
+            .child(tab.icon().view(theme.text_secondary).size(px(12.)))
+            .child(
+                div()
+                    .min_w(px(0.))
+                    .flex_grow()
+                    .truncate()
+                    .child(tab.title()),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("inspector-close-{id:?}")))
+                    .size(px(16.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .hover(|button| button.bg(theme.hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        if let Some(inspector) = this.open_inspector_mut() {
+                            inspector.close(id);
+                        }
+                        cx.notify();
+                    }))
+                    .child(Icon::Close.view(theme.text_secondary).size(px(11.))),
+            )
+            .into_any_element()
+    }
+
+    /// Navigation for the active page: back, forward, reload, address, open externally.
+    fn browser_toolbar(
+        &self,
+        browser: &Browser,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let tool = |id: &'static str, icon: Icon| icon_button(id, icon, theme);
+        let url = browser.url.clone();
+        div()
+            .h(px(38.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .child(
+                tool("browser-back", Icon::Back).on_click(cx.listener(|this, _, _, _| {
+                    this.active_browser().inspect(|browser| browser.back());
+                })),
+            )
+            .child(
+                tool("browser-forward", Icon::Forward).on_click(cx.listener(|this, _, _, _| {
+                    this.active_browser().inspect(|browser| browser.forward());
+                })),
+            )
+            .child(
+                tool("browser-reload", Icon::Reload).on_click(cx.listener(|this, _, _, _| {
+                    this.active_browser().inspect(|browser| browser.reload());
+                })),
+            )
+            .child(
+                div()
+                    .min_w(px(0.))
+                    .flex_grow()
+                    .px_1()
+                    .child(browser.address.clone()),
+            )
+            .child(
+                tool("browser-external", Icon::External)
+                    .tooltip(|_, cx| cx.new(|_| Tooltip("Open in browser".into())).into())
+                    .on_click(move |_, _, cx| cx.open_url(&url)),
+            )
+    }
+
+    /// Drag handle over a pane's left border; the root follows the drag.
+    fn divider(
+        &self,
+        id: &'static str,
+        divider: Divider,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left(px(-3.))
+            .w(px(6.))
+            .cursor_col_resize()
+            .when(self.resizing == Some(divider), |handle| {
+                handle.bg(theme.accent)
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.resizing = Some(divider);
+                    cx.notify();
+                }),
+            )
+    }
+
     /// A round badge: the provider's logo for agents, an initial for people.
     fn avatar(&self, author: MessageAuthor, size: f32, theme: &Theme) -> AnyElement {
         let provider = match author {
@@ -426,7 +842,7 @@ impl TomaShell {
             .collect();
 
         div()
-            .w(px(240.))
+            .w(px(SIDEBAR_WIDTH))
             .h_full()
             .flex_shrink_0()
             .flex()
@@ -527,7 +943,7 @@ impl TomaShell {
             .map(|path| path.display().to_string());
 
         div()
-            .min_w(px(360.))
+            .min_w(px(CONVERSATION_MIN))
             .flex_grow()
             .h_full()
             .flex()
@@ -619,6 +1035,7 @@ impl TomaShell {
             .iter()
             .find(|thread| thread.root_message_id == message.id)
             .cloned();
+        let on_link = self.link_handler(thread.as_ref().map(|thread| thread.id), cx);
         let footer = thread.map(|thread| {
             let id = thread.id;
             let replies = self
@@ -708,6 +1125,7 @@ impl TomaShell {
                         SharedString::from(format!("m-{}", message.id)),
                         &message.body,
                         theme,
+                        on_link,
                     ))
                     .children(footer),
             )
@@ -753,6 +1171,8 @@ impl TomaShell {
                 )
             })
             .collect();
+        let on_link = self.link_handler(Some(thread_id), cx);
+        let inspecting = self.open_inspector().is_some();
 
         Some(
             div()
@@ -807,19 +1227,18 @@ impl TomaShell {
                                 ),
                         )
                         .child(
-                            div()
-                                .id("close-thread")
-                                .size(px(24.))
-                                .flex_shrink_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(6.))
-                                .text_color(theme.text_secondary)
-                                .cursor_pointer()
-                                .hover(|button| button.bg(theme.hover))
-                                .on_click(cx.listener(|this, _, _, cx| this.close_thread(cx)))
-                                .child(Icon::Close.view(theme.text_secondary).size(px(14.))),
+                            icon_button("toggle-inspector", Icon::PanelRight, theme)
+                                .when(inspecting, |button| button.bg(theme.selection))
+                                .tooltip(|_, cx| {
+                                    cx.new(|_| Tooltip("Inspector  ⇧⌘B".into())).into()
+                                })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_inspector(window, cx)
+                                })),
+                        )
+                        .child(
+                            icon_button("close-thread", Icon::Close, theme)
+                                .on_click(cx.listener(|this, _, _, cx| this.close_thread(cx))),
                         ),
                 )
                 .child(
@@ -830,7 +1249,11 @@ impl TomaShell {
                         .track_scroll(&self.thread_scroll)
                         .px_4()
                         .py_3()
-                        .children(root.map(|message| self.thread_message(message, theme)))
+                        .children(
+                            root.map(|message| {
+                                self.thread_message(message, on_link.clone(), theme)
+                            }),
+                        )
                         .child(
                             div()
                                 .my_2()
@@ -846,9 +1269,9 @@ impl TomaShell {
                                 .child(div().flex_grow().h(px(1.)).bg(theme.separator)),
                         )
                         .children(
-                            replies
-                                .into_iter()
-                                .map(|message| self.thread_message(message, theme)),
+                            replies.into_iter().map(|message| {
+                                self.thread_message(message, on_link.clone(), theme)
+                            }),
                         )
                         .children(cards)
                         .children((!working.is_empty()).then(|| {
@@ -884,25 +1307,7 @@ impl TomaShell {
                                 ),
                         ),
                 )
-                // Drag handle over the divider; the root follows the drag.
-                .child(
-                    div()
-                        .id("thread-divider")
-                        .absolute()
-                        .top_0()
-                        .bottom_0()
-                        .left(px(-3.))
-                        .w(px(6.))
-                        .cursor_col_resize()
-                        .when(self.resizing_thread, |handle| handle.bg(theme.accent))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.resizing_thread = true;
-                                cx.notify();
-                            }),
-                        ),
-                ),
+                .child(self.divider("thread-divider", Divider::Thread, theme, cx)),
         )
     }
 
@@ -968,8 +1373,14 @@ impl TomaShell {
                     .flex()
                     .items_center()
                     .gap_1()
-                    .child(icon.view(if selected { theme.text } else { theme.text_secondary })
-                        .size(px(12.)))
+                    .child(
+                        icon.view(if selected {
+                            theme.text
+                        } else {
+                            theme.text_secondary
+                        })
+                        .size(px(12.)),
+                    )
                     .child(label)
             }))
     }
@@ -1080,7 +1491,7 @@ impl TomaShell {
             )
     }
 
-    fn thread_message(&self, message: Message, theme: &Theme) -> impl IntoElement {
+    fn thread_message(&self, message: Message, on_link: OnLink, theme: &Theme) -> impl IntoElement {
         let author = self.model.author_name(message.author).to_owned();
         div()
             .flex()
@@ -1100,6 +1511,7 @@ impl TomaShell {
                         SharedString::from(format!("t-{}", message.id)),
                         &message.body,
                         theme,
+                        on_link,
                     )),
             )
     }
@@ -1120,28 +1532,48 @@ impl Render for TomaShell {
         if let Some(focus) = self.pending_focus.take() {
             window.focus(&focus);
         }
+        let active = self.model.open_thread_id();
+        for (thread, inspector) in &mut self.inspectors {
+            inspector.sync_visibility(Some(*thread) == active);
+        }
+        let inspector = self.inspector(window, &theme, cx);
         focus_navigation(div())
             .size_full()
             .flex()
             .font_family(".SystemUIFont")
             .text_size(px(13.))
             .text_color(theme.text)
-            .when(self.resizing_thread, |root| root.cursor_col_resize())
+            .on_action(cx.listener(|this, _: &ToggleInspector, window, cx| {
+                this.toggle_inspector(window, cx)
+            }))
+            .when(self.resizing.is_some(), |root| root.cursor_col_resize())
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                if this.resizing_thread {
-                    // Stored unzoomed, since px() applies the zoom when drawing.
-                    let width = (window.viewport_size().width - event.position.x)
-                        / gpui::px(1.)
-                        / crate::zoom::zoom();
-                    this.thread_width = width.clamp(THREAD_WIDTH.0, THREAD_WIDTH.1);
-                    cx.notify();
+                let Some(divider) = this.resizing else {
+                    return;
+                };
+                // Stored unzoomed, since px() applies the zoom when drawing.
+                let from_right = (window.viewport_size().width - event.position.x)
+                    / gpui::px(1.)
+                    / crate::zoom::zoom();
+                match divider {
+                    Divider::Thread => {
+                        let inspector = match this.open_inspector() {
+                            Some(_) => this.inspector_room(window),
+                            None => 0.,
+                        };
+                        this.thread_width =
+                            (from_right - inspector).clamp(THREAD_WIDTH.0, THREAD_WIDTH.1);
+                    }
+                    Divider::Inspector => this.inspector_width = from_right.max(INSPECTOR_MIN),
                 }
+                cx.notify();
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    if this.resizing_thread {
-                        this.resizing_thread = false;
+                cx.listener(|this, _, window, cx| {
+                    if this.resizing.take().is_some() {
+                        // Forget any drag past the room the conversation leaves.
+                        this.inspector_width = this.inspector_room(window);
                         cx.notify();
                     }
                 }),
@@ -1149,7 +1581,23 @@ impl Render for TomaShell {
             .child(self.sidebar(&theme, cx))
             .child(self.conversation(&theme, cx))
             .children(self.thread_pane(&theme, cx))
+            .children(inspector)
     }
+}
+
+/// A square toolbar button holding one icon.
+fn icon_button(id: &'static str, icon: Icon, theme: &Theme) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .size(px(24.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.))
+        .cursor_pointer()
+        .hover(|button| button.bg(theme.hover))
+        .child(icon.view(theme.text_secondary).size(px(14.)))
 }
 
 /// Empty space in the title bar strip: drags the window, double-click zooms, like AppKit.

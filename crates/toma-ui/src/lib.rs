@@ -1,6 +1,8 @@
+mod browser;
 mod composer;
 mod controls;
 mod icons;
+mod inspector;
 mod markdown;
 mod shell;
 mod theme;
@@ -40,6 +42,7 @@ fn open(snapshot: WorkspaceSnapshot, backend: Option<(Arc<TomaCore>, WorkspaceId
             zoom::init(cx);
             bind_keys(cx);
             controls::bind_keys(cx);
+            inspector::bind_keys(cx);
             let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
             cx.open_window(
                 WindowOptions {

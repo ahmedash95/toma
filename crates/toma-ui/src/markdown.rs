@@ -1,10 +1,10 @@
 //! Markdown for chat messages: `parse` (pure) into a small block model, then `render_markdown`.
 
-use std::ops::Range;
+use std::{ops::Range, rc::Rc};
 
 use gpui::{
     AnyElement, App, ElementId, FontStyle, FontWeight, Hsla, InteractiveText, IntoElement,
-    ParentElement, SharedString, Styled, StyledText, TextRun, UnderlineStyle, div, font,
+    ParentElement, SharedString, Styled, StyledText, TextRun, UnderlineStyle, Window, div, font,
 };
 
 use crate::zoom::px;
@@ -198,15 +198,29 @@ fn inline(ev: &mut Events) -> Inline {
 
 // ---- rendering ----
 
+/// Called with a clicked link's URL; the host decides where it opens.
+pub type OnLink = Rc<dyn Fn(&str, &mut Window, &mut App)>;
+
 /// Renders Markdown `source` as GPUI elements. `id` must be unique among siblings.
-pub fn render_markdown(id: impl Into<ElementId>, source: &str, theme: &Theme) -> AnyElement {
+pub fn render_markdown(
+    id: impl Into<ElementId>,
+    source: &str,
+    theme: &Theme,
+    on_link: OnLink,
+) -> AnyElement {
     div()
         .w_full()
         .min_w(px(0.))
         .text_size(px(13.))
         .line_height(px(20.))
         .text_color(theme.text)
-        .child(block_list(&id.into(), &parse(source), theme, theme.text))
+        .child(block_list(
+            &id.into(),
+            &parse(source),
+            theme,
+            &on_link,
+            theme.text,
+        ))
         .into_any_element()
 }
 
@@ -220,7 +234,13 @@ fn font_w(family: &'static str, weight: FontWeight) -> gpui::Font {
     f
 }
 
-fn block_list(id: &ElementId, bs: &[Block], t: &Theme, color: Hsla) -> AnyElement {
+fn block_list(
+    id: &ElementId,
+    bs: &[Block],
+    t: &Theme,
+    on_link: &OnLink,
+    color: Hsla,
+) -> AnyElement {
     div()
         .flex()
         .flex_col()
@@ -230,14 +250,14 @@ fn block_list(id: &ElementId, bs: &[Block], t: &Theme, color: Hsla) -> AnyElemen
         .children(
             bs.iter()
                 .enumerate()
-                .map(|(i, b)| block(sub(id, i), b, t, color)),
+                .map(|(i, b)| block(sub(id, i), b, t, on_link, color)),
         )
         .into_any_element()
 }
 
-fn block(id: ElementId, b: &Block, t: &Theme, color: Hsla) -> AnyElement {
+fn block(id: ElementId, b: &Block, t: &Theme, on_link: &OnLink, color: Hsla) -> AnyElement {
     match b {
-        Block::Paragraph(i) => text(id, i, t, color, FontWeight::NORMAL),
+        Block::Paragraph(i) => text(id, i, t, on_link, color, FontWeight::NORMAL),
         Block::Heading(n, i) => {
             let size = match n {
                 1 => 18.,
@@ -247,7 +267,7 @@ fn block(id: ElementId, b: &Block, t: &Theme, color: Hsla) -> AnyElement {
             div()
                 .mt(px(4.))
                 .text_size(px(size))
-                .child(text(id, i, t, color, FontWeight::SEMIBOLD))
+                .child(text(id, i, t, on_link, color, FontWeight::SEMIBOLD))
                 .into_any_element()
         }
         Block::CodeBlock { text, .. } => div()
@@ -291,6 +311,7 @@ fn block(id: ElementId, b: &Block, t: &Theme, color: Hsla) -> AnyElement {
                         &sub(&id, n),
                         item,
                         t,
+                        on_link,
                         color,
                     )))
             }))
@@ -305,6 +326,7 @@ fn block(id: ElementId, b: &Block, t: &Theme, color: Hsla) -> AnyElement {
                 &id,
                 inner,
                 t,
+                on_link,
                 t.text_secondary,
             )))
             .into_any_element(),
@@ -336,7 +358,7 @@ fn block(id: ElementId, b: &Block, t: &Theme, color: Hsla) -> AnyElement {
                         .min_w(px(0.))
                         .px(px(6.))
                         .py(px(3.))
-                        .child(text(sub(&row_id, c), cell, t, color, weight))
+                        .child(text(sub(&row_id, c), cell, t, on_link, color, weight))
                 }))
             }))
             .into_any_element(),
@@ -344,7 +366,14 @@ fn block(id: ElementId, b: &Block, t: &Theme, color: Hsla) -> AnyElement {
 }
 
 /// Styled inline text; link ranges become clickable.
-fn text(id: ElementId, i: &Inline, t: &Theme, color: Hsla, weight: FontWeight) -> AnyElement {
+fn text(
+    id: ElementId,
+    i: &Inline,
+    t: &Theme,
+    on_link: &OnLink,
+    color: Hsla,
+    weight: FontWeight,
+) -> AnyElement {
     let base = |len| TextRun {
         len,
         font: font_w(".SystemUIFont", weight),
@@ -394,11 +423,13 @@ fn text(id: ElementId, i: &Inline, t: &Theme, color: Hsla, weight: FontWeight) -
     if links.is_empty() {
         el.child(styled).into_any_element()
     } else {
-        el.child(
-            InteractiveText::new(id, styled).on_click(links, move |ix, _, cx: &mut App| {
-                cx.open_url(&urls[ix]);
-            }),
-        )
+        let on_link = on_link.clone();
+        el.child(InteractiveText::new(id, styled).on_click(
+            links,
+            move |ix, window, cx: &mut App| {
+                on_link(&urls[ix], window, cx);
+            },
+        ))
         .into_any_element()
     }
 }
