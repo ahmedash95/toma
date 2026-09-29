@@ -436,6 +436,8 @@ pub struct Composer {
     blink_epoch: usize,
     blink_reset: bool,
     blink_task: Option<Task<()>>,
+    /// One line with tighter padding, for fields like the browser's address bar.
+    compact: bool,
 }
 
 impl Composer {
@@ -458,7 +460,13 @@ impl Composer {
             blink_epoch: 0,
             blink_reset: true,
             blink_task: None,
+            compact: false,
         }
+    }
+
+    pub fn compact(mut self) -> Self {
+        self.compact = true;
+        self
     }
 
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
@@ -537,6 +545,9 @@ impl Composer {
     }
 
     fn newline(&mut self, _: &act::Newline, _: &mut Window, cx: &mut Context<Self>) {
+        if self.compact {
+            return;
+        }
         self.model.insert("\n");
         self.changed(cx);
     }
@@ -684,7 +695,10 @@ impl Composer {
     }
     fn paste(&mut self, _: &act::Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            let text = text.replace("\r\n", "\n").replace('\r', "\n");
+            let mut text = text.replace("\r\n", "\n").replace('\r', "\n");
+            if self.compact {
+                text = text.replace('\n', " ");
+            }
             self.replace_text_in_range(None, &text, window, cx);
         }
     }
@@ -1233,9 +1247,9 @@ impl Render for Composer {
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_scroll_wheel(cx.listener(Self::on_scroll))
                     .w_full()
-                    .px(px(10.))
-                    .py(px(8.))
-                    .rounded(px(8.))
+                    .px(px(if self.compact { 8. } else { 10. }))
+                    .py(px(if self.compact { 3. } else { 8. }))
+                    .rounded(px(if self.compact { 6. } else { 8. }))
                     .border_1()
                     .border_color(if focused {
                         theme.accent
