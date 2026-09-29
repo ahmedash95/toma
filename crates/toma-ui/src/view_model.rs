@@ -214,6 +214,13 @@ impl ShellViewModel {
         })
     }
 
+    /// Names that `@name` can refer to in a message: every agent and person.
+    pub fn mention_names(&self) -> Vec<&str> {
+        let agents = self.snapshot.agents.iter().map(|a| a.name.as_str());
+        let people = self.snapshot.people.iter().map(|p| p.display_name.as_str());
+        agents.chain(people).collect()
+    }
+
     pub fn author_name(&self, author: MessageAuthor) -> &str {
         match author {
             MessageAuthor::Person(id) => self

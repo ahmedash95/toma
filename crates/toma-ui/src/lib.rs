@@ -4,6 +4,7 @@ mod controls;
 mod icons;
 mod inspector;
 mod markdown;
+mod selectable;
 mod shell;
 mod theme;
 mod view_model;
@@ -40,6 +41,7 @@ fn open(snapshot: WorkspaceSnapshot, backend: Option<(Arc<TomaCore>, WorkspaceId
         .run(move |cx: &mut App| {
             cx.set_global(Theme::for_appearance(cx.window_appearance()));
             zoom::init(cx);
+            selectable::init(cx);
             bind_keys(cx);
             controls::bind_keys(cx);
             inspector::bind_keys(cx);

@@ -23,6 +23,7 @@ icons! {
     Tokens => "lucide/coins.svg",
     Shield => "lucide/shield-check.svg",
     Check => "lucide/check.svg",
+    Copy => "lucide/copy.svg",
     Ban => "lucide/ban.svg",
     Hourglass => "lucide/hourglass.svg",
     Eye => "lucide/eye.svg",

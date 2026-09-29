@@ -1124,6 +1124,7 @@ impl TomaShell {
                     .child(render_markdown(
                         SharedString::from(format!("m-{}", message.id)),
                         &message.body,
+                        &self.model.mention_names(),
                         theme,
                         on_link,
                     ))
@@ -1510,6 +1511,7 @@ impl TomaShell {
                     .child(render_markdown(
                         SharedString::from(format!("t-{}", message.id)),
                         &message.body,
+                        &self.model.mention_names(),
                         theme,
                         on_link,
                     )),
