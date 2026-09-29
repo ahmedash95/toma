@@ -33,6 +33,7 @@ icons! {
     CircleCheck => "lucide/circle-check.svg",
     CircleX => "lucide/circle-x.svg",
     Plan => "lucide/clipboard-list.svg",
+    Sidebar => "lucide/panel-left.svg",
     Back => "lucide/arrow-left.svg",
     Forward => "lucide/arrow-right.svg",
     Reload => "lucide/rotate-cw.svg",

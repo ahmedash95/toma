@@ -45,6 +45,7 @@ fn open(snapshot: WorkspaceSnapshot, backend: Option<(Arc<TomaCore>, WorkspaceId
             selectable::init(cx);
             bind_keys(cx);
             controls::bind_keys(cx);
+            shell::bind_keys(cx);
             inspector::bind_keys(cx);
             palette::bind_keys(cx);
             let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);

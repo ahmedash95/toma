@@ -1,7 +1,8 @@
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Context, Entity, FocusHandle, Focusable, FontWeight,
-    Hsla, IntoElement, MouseButton, MouseMoveEvent, PathPromptOptions, Render, ScrollHandle,
-    SharedString, Subscription, Window, div, prelude::*, pulsating_between, rgb,
+    Hsla, IntoElement, KeyBinding, MouseButton, MouseMoveEvent, PathPromptOptions, Render,
+    ScrollHandle, SharedString, Subscription, Window, actions, div, ease_in_out, prelude::*,
+    pulsating_between, rgb,
 };
 
 use crate::zoom::px;
@@ -30,6 +31,8 @@ use crate::view_model::{ContextKey, ShellViewModel, ThreadStats};
 const TITLEBAR: f32 = 52.;
 const THREAD_WIDTH: (f32, f32) = (300., 900.);
 const SIDEBAR_WIDTH: f32 = 240.;
+/// Room the traffic lights take at the left of the title bar, unzoomed like the lights themselves.
+const TRAFFIC_LIGHTS: f32 = 78.;
 const CONVERSATION_MIN: f32 = 360.;
 const INSPECTOR_MIN: f32 = 320.;
 const RUN_DETAILS_WIDTH: f32 = 400.;
@@ -40,6 +43,12 @@ const STEP_TEXT_LIMIT: usize = 20_000;
 enum Divider {
     Thread,
     Inspector,
+}
+
+actions!(toma, [ToggleSidebar]);
+
+pub fn bind_keys(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("cmd-b", ToggleSidebar, None)]);
 }
 
 pub struct TomaShell {
@@ -57,6 +66,9 @@ pub struct TomaShell {
     /// Each thread's inspector tabs, kept alive while other threads are shown.
     inspectors: HashMap<ThreadId, Inspector>,
     browser_events: UnboundedSender<BrowserEvent>,
+    sidebar_visible: bool,
+    /// Times the sidebar was toggled; keys its slide animation, and 0 means no slide yet.
+    sidebar_toggles: u32,
     /// Focus to move to on the next frame, once the target element exists.
     pending_focus: Option<FocusHandle>,
     /// Deny, Allow, Always allow, Switch to Auto buttons of each pending permission request.
@@ -194,6 +206,8 @@ impl TomaShell {
                 resizing: None,
                 inspectors: HashMap::new(),
                 browser_events,
+                sidebar_visible: !sidebar_hidden_path().is_some_and(|path| path.exists()),
+                sidebar_toggles: 0,
                 pending_focus: None,
                 request_buttons: HashMap::new(),
                 focused_requests: HashSet::new(),
@@ -669,7 +683,12 @@ impl TomaShell {
     /// keeps its minimum.
     fn inspector_room(&self, window: &Window) -> f32 {
         let viewport = window.viewport_size().width / gpui::px(1.) / crate::zoom::zoom();
-        let room = viewport - SIDEBAR_WIDTH - CONVERSATION_MIN - self.thread_width;
+        let sidebar = if self.sidebar_visible {
+            SIDEBAR_WIDTH
+        } else {
+            0.
+        };
+        let room = viewport - sidebar - CONVERSATION_MIN - self.thread_width;
         self.inspector_width.min(room).max(INSPECTOR_MIN)
     }
 
@@ -1104,6 +1123,70 @@ impl TomaShell {
         }
     }
 
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_visible = !self.sidebar_visible;
+        self.sidebar_toggles += 1;
+        if let Some(path) = sidebar_hidden_path() {
+            let _ = if self.sidebar_visible {
+                std::fs::remove_file(path)
+            } else {
+                std::fs::create_dir_all(path.parent().expect("has parent"))
+                    .and_then(|_| std::fs::write(path, ""))
+            };
+        }
+        cx.notify();
+    }
+
+    /// Shows or hides the sidebar, like the toolbar button of a NavigationSplitView.
+    fn sidebar_toggle(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let label = if self.sidebar_visible {
+            "Hide sidebar (⌘B)"
+        } else {
+            "Show sidebar (⌘B)"
+        };
+        div()
+            .id("toggle-sidebar")
+            .size(px(26.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(5.))
+            .cursor_pointer()
+            .hover(|button| button.bg(theme.hover))
+            .tooltip(move |_window, cx| cx.new(|_| Tooltip(label.into())).into())
+            // Keeps the title bar underneath from starting a window drag.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
+            .child(Icon::Sidebar.view(theme.text_secondary).size(px(16.)))
+    }
+
+    /// The sidebar at full width, or sliding in or out right after a toggle.
+    fn sidebar_pane(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let showing = self.sidebar_visible;
+        if self.sidebar_toggles == 0 {
+            return showing.then(|| self.sidebar(theme, cx).into_any_element());
+        }
+        let separator = theme.separator;
+        Some(
+            div()
+                .h_full()
+                .flex_shrink_0()
+                .overflow_hidden()
+                .child(self.sidebar(theme, cx))
+                .with_animation(
+                    SharedString::from(format!("sidebar-{}", self.sidebar_toggles)),
+                    Animation::new(Duration::from_millis(200)).with_easing(ease_in_out),
+                    move |pane, delta| {
+                        let shown = if showing { delta } else { 1. - delta };
+                        pane.w(px(SIDEBAR_WIDTH * shown))
+                            .when(shown > 0., |pane| pane.border_r_1().border_color(separator))
+                    },
+                )
+                .into_any_element(),
+        )
+    }
+
     fn sidebar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_channel = self.model.selected_channel_id();
         let open_thread = self.model.open_thread_id();
@@ -1135,9 +1218,19 @@ impl TomaShell {
             .flex()
             .flex_col()
             .bg(theme.sidebar_bg)
-            .border_r_1()
-            .border_color(theme.separator)
-            .child(titlebar_drag_area().h(px(TITLEBAR)).flex_shrink_0())
+            .when(self.sidebar_toggles == 0, |sidebar| {
+                sidebar.border_r_1().border_color(theme.separator)
+            })
+            .child(
+                titlebar_drag_area()
+                    .h(px(TITLEBAR))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .px_2()
+                    .child(self.sidebar_toggle(theme, cx)),
+            )
             .child(
                 div()
                     .id("sidebar")
@@ -1262,35 +1355,44 @@ impl TomaShell {
                     .h(px(TITLEBAR))
                     .flex_shrink_0()
                     .flex()
-                    .flex_col()
-                    .justify_center()
+                    .items_center()
+                    .gap_2()
                     .px_5()
+                    .when(!self.sidebar_visible, |bar| bar.pl(gpui::px(TRAFFIC_LIGHTS)))
                     .border_b_1()
                     .border_color(theme.separator)
+                    .children((!self.sidebar_visible).then(|| self.sidebar_toggle(theme, cx)))
                     .child(
                         div()
+                            .flex_grow()
+                            .min_w(px(0.))
                             .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                if is_folder { Icon::Folder } else { Icon::Hash }
-                                    .view(theme.text_secondary)
-                                    .size(px(14.)),
-                            )
+                            .flex_col()
                             .child(
                                 div()
-                                    .text_size(px(13.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(name.clone()),
-                            ),
-                    )
-                    .children(folder.clone().map(|folder| {
-                        div()
-                            .text_size(px(11.))
-                            .text_color(theme.text_secondary)
-                            .truncate()
-                            .child(folder)
-                    })),
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        if is_folder { Icon::Folder } else { Icon::Hash }
+                                            .view(theme.text_secondary)
+                                            .size(px(14.)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(13.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(name.clone()),
+                                    ),
+                            )
+                            .children(folder.clone().map(|folder| {
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.text_secondary)
+                                    .truncate()
+                                    .child(folder)
+                            })),
+                    ),
             )
             .child(
                 div()
@@ -2261,13 +2363,18 @@ impl Render for TomaShell {
                     }
                 }),
             )
-            .child(self.sidebar(&theme, cx))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .children(self.sidebar_pane(&theme, cx))
             .child(self.conversation(&theme, cx))
             .children(self.thread_pane(&theme, cx))
             .children(inspector)
             .children(self.run_details_pane(&theme, cx))
             .children(self.palette_overlay(&theme, cx))
     }
+}
+
+fn sidebar_hidden_path() -> Option<std::path::PathBuf> {
+    crate::zoom::support_path("sidebar-hidden")
 }
 
 /// A square toolbar button holding one icon.
