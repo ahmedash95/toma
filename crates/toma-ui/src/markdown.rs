@@ -1,16 +1,23 @@
 //! Markdown for chat messages: `parse` (pure) into a small block model, then `render_markdown`.
 
 use std::ops::Range;
+use std::rc::Rc;
+
+use std::cell::RefCell;
+use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, ElementId, FontStyle, FontWeight, Hsla, InteractiveText, IntoElement,
-    ParentElement, SharedString, Styled, StyledText, TextRun, UnderlineStyle, div, font,
+    AnyElement, App, ClipboardItem, ElementId, FontStyle, FontWeight, Hsla, InteractiveElement,
+    IntoElement, ParentElement, StatefulInteractiveElement, Styled, TextRun, UnderlineStyle,
+    Window, div, font, prelude::FluentBuilder,
 };
 
 use crate::zoom::px;
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::Theme;
+use crate::icons::Icon;
+use crate::selectable::Doc;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Style {
@@ -18,6 +25,7 @@ struct Style {
     italic: bool,
     strike: bool,
     code: bool,
+    mention: bool,
     link: Option<String>,
 }
 
@@ -196,17 +204,109 @@ fn inline(ev: &mut Events) -> Inline {
     out
 }
 
+/// Byte ranges of `@name` mentions of `names` in `text`, bounded by non-word characters.
+fn mention_ranges(text: &str, names: &[&str]) -> Vec<Range<usize>> {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices('@')
+        .filter(|(at, _)| !text[..*at].chars().next_back().is_some_and(word))
+        .filter_map(|(at, _)| {
+            let rest = &text[at + 1..];
+            names
+                .iter()
+                .filter(|n| {
+                    !n.is_empty()
+                        && rest.starts_with(**n)
+                        && !rest[n.len()..].chars().next().is_some_and(word)
+                })
+                .map(|n| at..at + 1 + n.len())
+                .max_by_key(|r| r.len())
+        })
+        .collect()
+}
+
+/// Styles `@name` mentions outside code and links.
+fn mark_mentions(i: &mut Inline, names: &[&str]) {
+    let mentions: Vec<_> = mention_ranges(&i.text, names)
+        .into_iter()
+        .filter(|m| {
+            !i.spans
+                .iter()
+                .any(|(r, s)| (s.code || s.link.is_some()) && r.start < m.end && m.start < r.end)
+        })
+        .collect();
+    if mentions.is_empty() {
+        return;
+    }
+    let mut cuts: Vec<usize> = i
+        .spans
+        .iter()
+        .map(|(r, _)| r)
+        .chain(&mentions)
+        .flat_map(|r| [r.start, r.end])
+        .collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    i.spans = cuts
+        .windows(2)
+        .filter_map(|w| {
+            let seg = w[0]..w[1];
+            let inside = |r: &Range<usize>| r.start <= seg.start && seg.end <= r.end;
+            let mut st = i
+                .spans
+                .iter()
+                .find(|(r, _)| inside(r))
+                .map(|(_, s)| s.clone())
+                .unwrap_or_default();
+            st.mention = mentions.iter().any(inside);
+            (st != Style::default()).then_some((seg, st))
+        })
+        .collect();
+}
+
+fn mark_all(bs: &mut [Block], names: &[&str]) {
+    for b in bs {
+        match b {
+            Block::Paragraph(i) | Block::Heading(_, i) => mark_mentions(i, names),
+            Block::List { items, .. } => items.iter_mut().for_each(|it| mark_all(it, names)),
+            Block::Quote(inner) => mark_all(inner, names),
+            Block::Table { rows } => rows
+                .iter_mut()
+                .flatten()
+                .for_each(|c| mark_mentions(c, names)),
+            Block::CodeBlock { .. } | Block::Rule => {}
+        }
+    }
+}
+
 // ---- rendering ----
 
-/// Renders Markdown `source` as GPUI elements. `id` must be unique among siblings.
-pub fn render_markdown(id: impl Into<ElementId>, source: &str, theme: &Theme) -> AnyElement {
+/// Called with a clicked link's URL; the host decides where it opens.
+pub type OnLink = Rc<dyn Fn(&str, &mut Window, &mut App)>;
+
+thread_local! {
+    /// The code block whose copy button was just pressed, shown as copied for a moment.
+    static COPIED: RefCell<Option<ElementId>> = const { RefCell::new(None) };
+}
+
+/// Renders Markdown `source` as GPUI elements, highlighting `@name` for each of `mentions`.
+/// `id` must be unique among siblings.
+pub fn render_markdown(
+    id: impl Into<ElementId>,
+    source: &str,
+    mentions: &[&str],
+    theme: &Theme,
+    on_link: OnLink,
+) -> AnyElement {
+    let doc = Doc::new(id.into(), on_link);
+    let mut blocks = parse(source);
+    mark_all(&mut blocks, mentions);
     div()
         .w_full()
         .min_w(px(0.))
         .text_size(px(13.))
         .line_height(px(20.))
         .text_color(theme.text)
-        .child(block_list(&id.into(), &parse(source), theme, theme.text))
+        .child(block_list(&doc, &doc.id, &blocks, theme, theme.text))
         .into_any_element()
 }
 
@@ -220,7 +320,7 @@ fn font_w(family: &'static str, weight: FontWeight) -> gpui::Font {
     f
 }
 
-fn block_list(id: &ElementId, bs: &[Block], t: &Theme, color: Hsla) -> AnyElement {
+fn block_list(doc: &Doc, id: &ElementId, bs: &[Block], t: &Theme, color: Hsla) -> AnyElement {
     div()
         .flex()
         .flex_col()
@@ -230,14 +330,14 @@ fn block_list(id: &ElementId, bs: &[Block], t: &Theme, color: Hsla) -> AnyElemen
         .children(
             bs.iter()
                 .enumerate()
-                .map(|(i, b)| block(sub(id, i), b, t, color)),
+                .map(|(i, b)| block(doc, sub(id, i), b, t, color)),
         )
         .into_any_element()
 }
 
-fn block(id: ElementId, b: &Block, t: &Theme, color: Hsla) -> AnyElement {
+fn block(doc: &Doc, id: ElementId, b: &Block, t: &Theme, color: Hsla) -> AnyElement {
     match b {
-        Block::Paragraph(i) => text(id, i, t, color, FontWeight::NORMAL),
+        Block::Paragraph(i) => text(doc, i, t, color, FontWeight::NORMAL),
         Block::Heading(n, i) => {
             let size = match n {
                 1 => 18.,
@@ -247,20 +347,27 @@ fn block(id: ElementId, b: &Block, t: &Theme, color: Hsla) -> AnyElement {
             div()
                 .mt(px(4.))
                 .text_size(px(size))
-                .child(text(id, i, t, color, FontWeight::SEMIBOLD))
+                .child(text(doc, i, t, color, FontWeight::SEMIBOLD))
                 .into_any_element()
         }
-        Block::CodeBlock { text, .. } => div()
-            .w_full()
-            .min_w(px(0.))
-            .p(px(8.))
-            .rounded(px(6.))
-            .bg(t.code_bg)
-            .font_family("Menlo")
-            .text_size(px(12.))
-            .line_height(px(18.))
-            .child(SharedString::from(text.trim_end_matches('\n').to_string()))
-            .into_any_element(),
+        Block::CodeBlock { text, .. } => {
+            let code = text.trim_end_matches('\n').to_string();
+            div()
+                .group("code")
+                .relative()
+                .w_full()
+                .min_w(px(0.))
+                .p(px(8.))
+                .pr(px(32.))
+                .rounded(px(6.))
+                .bg(t.code_bg)
+                .font_family("Menlo")
+                .text_size(px(12.))
+                .line_height(px(18.))
+                .child(doc.leaf(code.clone(), None, Vec::new()))
+                .child(copy_button(sub(&id, 0), code, t))
+                .into_any_element()
+        }
         Block::List {
             ordered,
             start,
@@ -288,6 +395,7 @@ fn block(id: ElementId, b: &Block, t: &Theme, color: Hsla) -> AnyElement {
                             .child(marker),
                     )
                     .child(div().flex_1().min_w(px(0.)).child(block_list(
+                        doc,
                         &sub(&id, n),
                         item,
                         t,
@@ -302,6 +410,7 @@ fn block(id: ElementId, b: &Block, t: &Theme, color: Hsla) -> AnyElement {
             .min_w(px(0.))
             .child(div().w(px(3.)).flex_none().rounded(px(1.5)).bg(t.separator))
             .child(div().flex_1().min_w(px(0.)).pl(px(8.)).child(block_list(
+                doc,
                 &id,
                 inner,
                 t,
@@ -325,26 +434,65 @@ fn block(id: ElementId, b: &Block, t: &Theme, color: Hsla) -> AnyElement {
                 } else {
                     FontWeight::NORMAL
                 };
-                let row_id = sub(&id, r);
                 let mut line = div().flex().flex_row().border_color(t.separator);
                 if r + 1 < rows.len() {
                     line = line.border_b_1();
                 }
-                line.children(row.iter().enumerate().map(|(c, cell)| {
+                line.children(row.iter().map(|cell| {
                     div()
                         .flex_1()
                         .min_w(px(0.))
                         .px(px(6.))
                         .py(px(3.))
-                        .child(text(sub(&row_id, c), cell, t, color, weight))
+                        .child(text(doc, cell, t, color, weight))
                 }))
             }))
             .into_any_element(),
     }
 }
 
+/// Copies `code` to the clipboard; appears when the code block is hovered.
+fn copy_button(id: ElementId, code: String, t: &Theme) -> impl IntoElement {
+    let copied = COPIED.with_borrow(|c| c.as_ref() == Some(&id));
+    let (icon, color) = if copied {
+        (Icon::Check, t.green)
+    } else {
+        (Icon::Copy, t.text_secondary)
+    };
+    div()
+        .id(id.clone())
+        .absolute()
+        .top(px(6.))
+        .right(px(6.))
+        .p(px(4.))
+        .rounded(px(4.))
+        .cursor_pointer()
+        .occlude()
+        .when(!copied, |d| {
+            d.opacity(0.).group_hover("code", |s| s.opacity(1.))
+        })
+        .hover(|s| s.bg(t.hover))
+        .on_click(move |_, window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(code.clone()));
+            COPIED.set(Some(id.clone()));
+            window.refresh();
+            let id = id.clone();
+            cx.spawn(async move |cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(1500))
+                    .await;
+                if COPIED.with_borrow(|c| c.as_ref() == Some(&id)) {
+                    COPIED.set(None);
+                    cx.update(|cx| cx.refresh_windows()).ok();
+                }
+            })
+            .detach();
+        })
+        .child(icon.view(color).size(px(14.)))
+}
+
 /// Styled inline text; link ranges become clickable.
-fn text(id: ElementId, i: &Inline, t: &Theme, color: Hsla, weight: FontWeight) -> AnyElement {
+fn text(doc: &Doc, i: &Inline, t: &Theme, color: Hsla, weight: FontWeight) -> AnyElement {
     let base = |len| TextRun {
         len,
         font: font_w(".SystemUIFont", weight),
@@ -354,7 +502,7 @@ fn text(id: ElementId, i: &Inline, t: &Theme, color: Hsla, weight: FontWeight) -
         strikethrough: None,
     };
     let (mut runs, mut pos) = (Vec::new(), 0);
-    let (mut links, mut urls) = (Vec::new(), Vec::new());
+    let mut links = Vec::new();
     for (r, s) in &i.spans {
         if r.start > pos {
             runs.push(base(r.start - pos));
@@ -373,6 +521,11 @@ fn text(id: ElementId, i: &Inline, t: &Theme, color: Hsla, weight: FontWeight) -
         if s.strike {
             run.strikethrough = Some(Default::default());
         }
+        if s.mention {
+            run.color = t.accent;
+            run.font.weight = FontWeight::SEMIBOLD;
+            run.background_color = Some(t.accent.opacity(if t.dark { 0.25 } else { 0.12 }));
+        }
         if let Some(url) = &s.link {
             run.color = t.accent;
             run.underline = Some(UnderlineStyle {
@@ -380,8 +533,7 @@ fn text(id: ElementId, i: &Inline, t: &Theme, color: Hsla, weight: FontWeight) -
                 color: Some(t.accent),
                 wavy: false,
             });
-            links.push(r.clone());
-            urls.push(url.clone());
+            links.push((r.clone(), url.clone()));
         }
         runs.push(run);
         pos = r.end;
@@ -389,18 +541,11 @@ fn text(id: ElementId, i: &Inline, t: &Theme, color: Hsla, weight: FontWeight) -
     if pos < i.text.len() {
         runs.push(base(i.text.len() - pos));
     }
-    let styled = StyledText::new(i.text.clone()).with_runs(runs);
-    let el = div().w_full().min_w(px(0.));
-    if links.is_empty() {
-        el.child(styled).into_any_element()
-    } else {
-        el.child(
-            InteractiveText::new(id, styled).on_click(links, move |ix, _, cx: &mut App| {
-                cx.open_url(&urls[ix]);
-            }),
-        )
+    div()
+        .w_full()
+        .min_w(px(0.))
+        .child(doc.leaf(i.text.clone(), Some(runs), links))
         .into_any_element()
-    }
 }
 
 #[cfg(test)]
@@ -468,6 +613,19 @@ mod tests {
         let i = para("see [docs](https://x.dev/a) now");
         assert_eq!(i.spans[0].1.link.as_deref(), Some("https://x.dev/a"));
         assert_eq!(&i.text[i.spans[0].0.clone()], "docs");
+    }
+
+    #[test]
+    fn mentions() {
+        let mut i = para("hi @Claude and **@Codex**, not `@Claude`, a@Claude, @Claudette");
+        mark_mentions(&mut i, &["Claude", "Codex"]);
+        let marked: Vec<_> = i
+            .spans
+            .iter()
+            .filter(|(_, s)| s.mention)
+            .map(|(r, s)| (&i.text[r.clone()], s.bold))
+            .collect();
+        assert_eq!(marked, [("@Claude", false), ("@Codex", true)]);
     }
 
     #[test]

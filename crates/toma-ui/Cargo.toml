@@ -6,9 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+futures = { version = "0.3", default-features = false, features = ["std"] }
 gpui.workspace = true
 libc = "0.2.189"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 toma-core.workspace = true
 toma-domain.workspace = true
 toma-storage.workspace = true
+wry = { version = "0.57", default-features = false }

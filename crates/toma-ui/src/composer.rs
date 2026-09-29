@@ -367,6 +367,10 @@ impl ComposerModel {
 pub enum ComposerEvent {
     Changed(String),
     Submitted(String),
+    /// Up / Down in a search field, for the list below it.
+    Navigate(isize),
+    /// Escape in a search field.
+    Cancelled,
 }
 
 /// Text laid out by the last paint, in content coordinates (origin = top-left of the text area).
@@ -436,6 +440,11 @@ pub struct Composer {
     blink_epoch: usize,
     blink_reset: bool,
     blink_task: Option<Task<()>>,
+    /// One line with tighter padding, for fields like the browser's address bar.
+    compact: bool,
+    /// A single-line search field: Enter submits the query as is, and Up / Down / Escape
+    /// are reported to the owner instead of moving the caret.
+    search: bool,
 }
 
 impl Composer {
@@ -458,7 +467,21 @@ impl Composer {
             blink_epoch: 0,
             blink_reset: true,
             blink_task: None,
+            compact: false,
+            search: false,
         }
+    }
+
+    pub fn search(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
+        Self {
+            search: true,
+            ..Self::new(String::new(), Vec::new(), placeholder, cx)
+        }
+    }
+
+    pub fn compact(mut self) -> Self {
+        self.compact = true;
+        self
     }
 
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
@@ -524,6 +547,9 @@ impl Composer {
     }
 
     fn enter(&mut self, _: &act::Enter, _: &mut Window, cx: &mut Context<Self>) {
+        if self.search {
+            return cx.emit(ComposerEvent::Submitted(self.model.text().to_owned()));
+        }
         if self.model.palette_open() && self.model.accept_mention() {
             self.marked_range = None;
             return self.changed(cx);
@@ -537,12 +563,17 @@ impl Composer {
     }
 
     fn newline(&mut self, _: &act::Newline, _: &mut Window, cx: &mut Context<Self>) {
+        if self.compact || self.search {
+            return;
+        }
         self.model.insert("\n");
         self.changed(cx);
     }
 
     fn escape(&mut self, _: &act::Escape, _: &mut Window, cx: &mut Context<Self>) {
-        if self.model.palette_open() {
+        if self.search {
+            cx.emit(ComposerEvent::Cancelled);
+        } else if self.model.palette_open() {
             self.model.dismiss_palette();
             cx.notify();
         } else {
@@ -560,7 +591,9 @@ impl Composer {
     }
 
     fn up(&mut self, _: &act::Up, _: &mut Window, cx: &mut Context<Self>) {
-        if self.model.palette_open() {
+        if self.search {
+            cx.emit(ComposerEvent::Navigate(-1));
+        } else if self.model.palette_open() {
             self.model.select_next(-1);
             cx.notify();
         } else {
@@ -569,7 +602,9 @@ impl Composer {
     }
 
     fn down(&mut self, _: &act::Down, _: &mut Window, cx: &mut Context<Self>) {
-        if self.model.palette_open() {
+        if self.search {
+            cx.emit(ComposerEvent::Navigate(1));
+        } else if self.model.palette_open() {
             self.model.select_next(1);
             cx.notify();
         } else {
@@ -684,7 +719,10 @@ impl Composer {
     }
     fn paste(&mut self, _: &act::Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            let text = text.replace("\r\n", "\n").replace('\r', "\n");
+            let mut text = text.replace("\r\n", "\n").replace('\r', "\n");
+            if self.compact || self.search {
+                text = text.replace('\n', " ");
+            }
             self.replace_text_in_range(None, &text, window, cx);
         }
     }
@@ -1233,9 +1271,9 @@ impl Render for Composer {
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_scroll_wheel(cx.listener(Self::on_scroll))
                     .w_full()
-                    .px(px(10.))
-                    .py(px(8.))
-                    .rounded(px(8.))
+                    .px(px(if self.compact { 8. } else { 10. }))
+                    .py(px(if self.compact { 3. } else { 8. }))
+                    .rounded(px(if self.compact { 6. } else { 8. }))
                     .border_1()
                     .border_color(if focused {
                         theme.accent
