@@ -31,6 +31,7 @@ fn main() {
             thread_id: None,
             author: MessageAuthor::Person(person_id),
             body: ask.into(),
+            run_id: None,
             created_at: created,
         });
         for reply in replies {
@@ -40,6 +41,7 @@ fn main() {
                 thread_id: Some(id),
                 author: MessageAuthor::Agent(agent),
                 body: (*reply).into(),
+                run_id: None,
                 created_at: tick(),
             });
         }
@@ -98,6 +100,7 @@ fn main() {
         thread_id: None,
         author: MessageAuthor::Person(person_id),
         body: "A link outside any thread opens in the system browser: https://github.com".into(),
+        run_id: None,
         created_at: tick(),
     });
 

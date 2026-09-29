@@ -62,6 +62,9 @@ pub struct Message {
     pub author: MessageAuthor,
     pub body: String,
     pub created_at: TimestampMs,
+    /// The agent run that produced this message; its raw output backs the run details.
+    #[serde(default)]
+    pub run_id: Option<RunId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -203,4 +206,41 @@ pub struct RunUsage {
     /// Millionths of a US dollar, when the provider reports cost.
     pub cost_micros: Option<i64>,
     pub duration_ms: Option<i64>,
+}
+
+/// One step of what an agent did during a run, recovered from the provider's raw output.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TranscriptEntry {
+    pub at: TimestampMs,
+    /// Done by a subagent the run delegated to, rather than the agent itself.
+    pub subagent: bool,
+    pub step: TranscriptStep,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TranscriptStep {
+    /// The reasoning summary the provider chose to share; never the hidden chain of thought.
+    Thinking {
+        text: String,
+    },
+    Text {
+        text: String,
+    },
+    ToolCall {
+        name: String,
+        /// One line saying what the call does, such as the command or file path.
+        summary: String,
+        input: String,
+    },
+    ToolResult {
+        output: String,
+        is_error: bool,
+    },
+    Notice {
+        text: String,
+    },
+    Error {
+        text: String,
+    },
 }

@@ -122,6 +122,7 @@ fn sample_snapshot() -> WorkspaceSnapshot {
             author: MessageAuthor::Person(person_id),
             body: format!("@Builder {title}"),
             created_at: updated_at,
+            run_id: None,
         };
         let thread = TaskThread {
             id: ThreadId::new(),
@@ -163,11 +164,11 @@ fn sample_snapshot() -> WorkspaceSnapshot {
             AgentDefinition { id: researcher_id, workspace_id, name: "Researcher".into(), role: "Investigation".into(), instructions: String::new(), provider: RunnerProvider::ClaudeCodeCli, enabled: true },
         ],
         messages: vec![
-            Message { id: root_id, channel_id: general_id, thread_id: None, author: MessageAuthor::Person(person_id), body: "Let's make the first native shell feel focused and useful. Keep the conversation dense, and make agent state readable at a glance.".into(), created_at: 1 },
-            Message { id: MessageId::new(), channel_id: general_id, thread_id: None, author: MessageAuthor::Agent(builder_id), body: "I've mapped the domain snapshot into the shell. The composer keeps a separate draft for every channel and thread.".into(), created_at: 2 },
-            Message { id: MessageId::new(), channel_id: general_id, thread_id: None, author: MessageAuthor::Agent(reviewer_id), body: "Reviewing keyboard behavior and empty-state edges now. One thread needs your input before it can continue.".into(), created_at: 3 },
-            Message { id: MessageId::new(), channel_id: general_id, thread_id: Some(thread_id), author: MessageAuthor::Agent(builder_id), body: "The main pane and thread context stay independent, including their drafts.".into(), created_at: 4 },
-            Message { id: MessageId::new(), channel_id: shipping_id, thread_id: None, author: MessageAuthor::Person(person_id), body: "Prepare the release notes once the shell is ready.".into(), created_at: 5 },
+            Message { id: root_id, channel_id: general_id, thread_id: None, author: MessageAuthor::Person(person_id), body: "Let's make the first native shell feel focused and useful. Keep the conversation dense, and make agent state readable at a glance.".into(), created_at: 1, run_id: None },
+            Message { id: MessageId::new(), channel_id: general_id, thread_id: None, author: MessageAuthor::Agent(builder_id), body: "I've mapped the domain snapshot into the shell. The composer keeps a separate draft for every channel and thread.".into(), created_at: 2, run_id: None },
+            Message { id: MessageId::new(), channel_id: general_id, thread_id: None, author: MessageAuthor::Agent(reviewer_id), body: "Reviewing keyboard behavior and empty-state edges now. One thread needs your input before it can continue.".into(), created_at: 3, run_id: None },
+            Message { id: MessageId::new(), channel_id: general_id, thread_id: Some(thread_id), author: MessageAuthor::Agent(builder_id), body: "The main pane and thread context stay independent, including their drafts.".into(), created_at: 4, run_id: None },
+            Message { id: MessageId::new(), channel_id: shipping_id, thread_id: None, author: MessageAuthor::Person(person_id), body: "Prepare the release notes once the shell is ready.".into(), created_at: 5, run_id: None },
         ]
         .into_iter()
         .chain(extra_threads.iter().map(|(root, _)| root.clone()))

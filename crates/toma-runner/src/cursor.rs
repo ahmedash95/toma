@@ -1,8 +1,9 @@
 use crate::process::{CommandSpec, ProcessRunner};
+use crate::transcript::{Transcript, pretty, tool_summary};
 use crate::{AgentRunner, RunRequest, RunnerCapabilities, RunnerError, RunnerEvent, translate};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use toma_domain::{PermissionMode, RunId, RunnerProvider};
+use toma_domain::{PermissionMode, RunId, RunnerProvider, TranscriptStep};
 
 #[derive(Clone)]
 pub struct CursorCliRunner {
@@ -102,6 +103,98 @@ fn cursor_events(line: &serde_json::Value) -> Vec<RunnerEvent> {
     }
 }
 
+/// Adds the steps in a stream-json line. Text and thinking arrive as fragments; the
+/// flush and final `assistant` lines repeat them, as in `cursor_events`.
+pub(crate) fn transcript_line(transcript: &mut Transcript, line: &serde_json::Value) {
+    match (line["type"].as_str(), line["subtype"].as_str()) {
+        (Some("thinking"), Some("delta")) => {
+            transcript.append_thinking(line["text"].as_str().unwrap_or_default())
+        }
+        (Some("assistant"), _)
+            if line["model_call_id"].is_null() && !line["timestamp_ms"].is_null() =>
+        {
+            transcript.append_text(
+                line["message"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default(),
+            )
+        }
+        (Some("tool_call"), Some(subtype)) => {
+            // `{"shellToolCall": {"args": …, "result": …}}`, or a generic `function` call.
+            let Some((kind, call)) = line["tool_call"]
+                .as_object()
+                .and_then(|call| call.iter().next())
+            else {
+                return;
+            };
+            match subtype {
+                "started" => {
+                    let (name, args) = match kind.as_str() {
+                        "function" => {
+                            let arguments = &call["arguments"];
+                            let parsed = arguments
+                                .as_str()
+                                .and_then(|text| serde_json::from_str(text).ok())
+                                .unwrap_or_else(|| arguments.clone());
+                            (call["name"].as_str().unwrap_or("tool").to_owned(), parsed)
+                        }
+                        kind => (tool_name(kind), call["args"].clone()),
+                    };
+                    transcript.push(TranscriptStep::ToolCall {
+                        name,
+                        summary: tool_summary(&args),
+                        input: pretty(&args),
+                    });
+                }
+                "completed" => {
+                    let result = &call["result"];
+                    let (output, is_error) = match result.as_object().and_then(|r| r.iter().next())
+                    {
+                        Some((outcome, detail)) => (tool_output(detail), outcome != "success"),
+                        None => (pretty(result), false),
+                    };
+                    transcript.push(TranscriptStep::ToolResult { output, is_error });
+                }
+                _ => {}
+            }
+        }
+        (Some("result"), _) if line["is_error"] == true => transcript.push(TranscriptStep::Error {
+            text: line["result"]
+                .as_str()
+                .unwrap_or("The run failed")
+                .to_owned(),
+        }),
+        _ => {}
+    }
+}
+
+/// `readToolCall` → `Read`.
+fn tool_name(kind: &str) -> String {
+    let name = kind.strip_suffix("ToolCall").unwrap_or(kind);
+    let mut chars = name.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
+/// Shell output, file content, or the outcome's fields when it has neither.
+fn tool_output(detail: &serde_json::Value) -> String {
+    let streams: Vec<&str> = ["stdout", "stderr"]
+        .iter()
+        .filter_map(|key| detail[key].as_str())
+        .filter(|text| !text.trim().is_empty())
+        .collect();
+    if !streams.is_empty() {
+        return streams.join("\n");
+    }
+    detail["content"]
+        .as_str()
+        .or(detail["message"].as_str())
+        .or(detail["error"].as_str())
+        .map_or_else(|| pretty(detail), str::to_owned)
+}
+
 impl Default for CursorCliRunner {
     fn default() -> Self {
         Self::new()
@@ -139,5 +232,59 @@ impl AgentRunner for CursorCliRunner {
 
     fn cancel(&self, run_id: RunId) -> Result<(), RunnerError> {
         self.process.cancel(run_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcript_joins_fragments_around_tool_calls() {
+        let mut transcript = Transcript::new(RunnerProvider::CursorCli);
+        for line in [
+            r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+            r#"{"type":"thinking","subtype":"delta","text":"Look at "}"#,
+            r#"{"type":"thinking","subtype":"delta","text":"the file."}"#,
+            r#"{"type":"thinking","subtype":"completed"}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Reading "}]},"timestamp_ms":1}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"it."}]},"timestamp_ms":2}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Reading it."}]},"model_call_id":"m"}"#,
+            r#"{"type":"tool_call","subtype":"started","call_id":"c","tool_call":{"readToolCall":{"args":{"path":"a.rs"}}}}"#,
+            r#"{"type":"tool_call","subtype":"completed","call_id":"c","tool_call":{"readToolCall":{"args":{"path":"a.rs"},"result":{"success":{"content":"fn main() {}"}}}}}"#,
+            r#"{"type":"tool_call","subtype":"completed","call_id":"d","tool_call":{"shellToolCall":{"args":{"command":"x"},"result":{"failure":{"stdout":"","stderr":"not found","exitCode":127}}}}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done."}]},"timestamp_ms":3}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Reading it.Done."}]}}"#,
+        ] {
+            assert!(transcript.line(line, 0));
+        }
+        let steps: Vec<_> = transcript.finish().into_iter().map(|e| e.step).collect();
+        assert_eq!(
+            steps,
+            vec![
+                TranscriptStep::Thinking {
+                    text: "Look at the file.".into()
+                },
+                TranscriptStep::Text {
+                    text: "Reading it.".into()
+                },
+                TranscriptStep::ToolCall {
+                    name: "Read".into(),
+                    summary: "a.rs".into(),
+                    input: "{\n  \"path\": \"a.rs\"\n}".into(),
+                },
+                TranscriptStep::ToolResult {
+                    output: "fn main() {}".into(),
+                    is_error: false
+                },
+                TranscriptStep::ToolResult {
+                    output: "not found".into(),
+                    is_error: true
+                },
+                TranscriptStep::Text {
+                    text: "Done.".into()
+                },
+            ]
+        );
     }
 }

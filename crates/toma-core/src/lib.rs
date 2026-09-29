@@ -9,7 +9,7 @@ use std::{
 
 use thiserror::Error;
 use toma_domain::*;
-use toma_runner::{AgentRunner, RunRequest, RunnerError, RunnerEvent};
+use toma_runner::{AgentRunner, RunRequest, RunnerError, RunnerEvent, Transcript};
 use toma_storage::{StorageError, TomaStore, WorkspaceSnapshot};
 use toma_worktree::{WorktreeError, WorktreeManager, WorktreeRequest};
 
@@ -113,6 +113,35 @@ impl TomaCore {
         } else {
             self.snapshot(workspace_id)
         }
+    }
+
+    /// What the agent did during `run_id`: reasoning summaries, tool calls and their
+    /// results, and its replies, rebuilt from the run's raw history.
+    pub fn run_transcript(&self, run_id: RunId) -> Result<Vec<TranscriptEntry>, CoreError> {
+        let provider = {
+            let state = self.state()?;
+            state
+                .snapshots
+                .values()
+                .find_map(|snapshot| {
+                    let (_, agent_id) = run_owner(snapshot, run_id).ok()?;
+                    snapshot
+                        .agents
+                        .iter()
+                        .find(|agent| agent.id == agent_id)
+                        .map(|agent| agent.provider)
+                })
+                .ok_or_else(|| CoreError::InvalidCommand("unknown or unloaded run".into()))?
+        };
+        let mut transcript = Transcript::new(provider);
+        for entry in self.store.raw_history(run_id)? {
+            if !transcript.line(&entry.payload, entry.created_at)
+                && let Some(step) = recorded_step(&entry.payload)
+            {
+                transcript.push_at(step, entry.created_at);
+            }
+        }
+        Ok(transcript.finish())
     }
 
     pub fn dispatch(&self, command: AppCommand) -> Result<Vec<AppEvent>, CoreError> {
@@ -231,6 +260,7 @@ impl TomaCore {
             author: self.default_author(workspace_id)?,
             body,
             created_at: self.clock.now_ms(),
+            run_id: None,
         };
         let attachments: Vec<_> = targets
             .iter()
@@ -896,6 +926,7 @@ impl TomaCore {
                 ),
             },
             created_at: self.clock.now_ms(),
+            run_id: None,
         };
         self.store.insert_message(&message, &[])?;
         self.state()?
@@ -1520,7 +1551,29 @@ fn reply_message(
         author: MessageAuthor::Agent(session.agent_id),
         body,
         created_at: now,
+        run_id: Some(run_id),
     }))
+}
+
+/// The transcript step for a history record written by `raw_payload` or `fail_run`.
+fn recorded_step(payload: &str) -> Option<TranscriptStep> {
+    if let Some(message) = payload
+        .strip_prefix("failed:")
+        .or_else(|| payload.strip_prefix("orchestrator_error:"))
+    {
+        return Some(TranscriptStep::Error {
+            text: message.to_owned(),
+        });
+    }
+    if let Some(request) = payload.strip_prefix("permission_request:") {
+        let (tool, detail) = request.split_once(':').unwrap_or((request, ""));
+        return Some(TranscriptStep::Notice {
+            text: format!("Asked to use {tool}: {detail}"),
+        });
+    }
+    (payload == "cancelled").then(|| TranscriptStep::Notice {
+        text: "Cancelled".into(),
+    })
 }
 
 fn raw_payload(event: &RunnerEvent) -> String {

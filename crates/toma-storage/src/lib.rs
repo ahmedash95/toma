@@ -24,7 +24,7 @@ macro_rules! from_json {
     };
 }
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const MIGRATION_1: &str = include_str!("migration_1.sql");
 
 #[derive(Debug, Error)]
@@ -67,6 +67,8 @@ pub trait TomaStore: Send + Sync {
         payload: &str,
         at: TimestampMs,
     ) -> StorageResult<()>;
+    /// Every raw line a run produced, in order.
+    fn raw_history(&self, run_id: RunId) -> StorageResult<Vec<RawHistoryEntry>>;
     fn save_worktree(&self, worktree: &WorktreeRecord) -> StorageResult<()>;
     fn save_run_usage(&self, usage: &RunUsage) -> StorageResult<()>;
     fn set_permission_mode(&self, thread_id: ThreadId, mode: PermissionMode) -> StorageResult<()>;
@@ -225,32 +227,6 @@ impl SqliteStore {
         }
         tx.commit()?;
         Ok(workspace_id)
-    }
-
-    pub fn raw_history(&self, run_id: RunId) -> StorageResult<Vec<RawHistoryEntry>> {
-        let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT run_id, sequence, payload, created_at FROM raw_history WHERE run_id = ?1 ORDER BY sequence",
-        )?;
-        let rows = statement.query_map([run_id.to_string()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-            ))
-        })?;
-        collect_rows(rows)?
-            .into_iter()
-            .map(|(run_id, sequence, payload, created_at)| {
-                Ok(RawHistoryEntry {
-                    run_id: parse_id(&run_id)?,
-                    sequence,
-                    payload,
-                    created_at,
-                })
-            })
-            .collect()
     }
 }
 
@@ -452,6 +428,32 @@ impl TomaStore for SqliteStore {
         Ok(())
     }
 
+    fn raw_history(&self, run_id: RunId) -> StorageResult<Vec<RawHistoryEntry>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT run_id, sequence, payload, created_at FROM raw_history WHERE run_id = ?1 ORDER BY sequence",
+        )?;
+        let rows = statement.query_map([run_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+            ))
+        })?;
+        collect_rows(rows)?
+            .into_iter()
+            .map(|(run_id, sequence, payload, created_at)| {
+                Ok(RawHistoryEntry {
+                    run_id: parse_id(&run_id)?,
+                    sequence,
+                    payload,
+                    created_at,
+                })
+            })
+            .collect()
+    }
+
     fn append_raw_history(
         &self,
         run_id: RunId,
@@ -559,6 +561,12 @@ fn migrate(connection: &mut Connection) -> StorageResult<()> {
         tx.pragma_update(None, "user_version", 4)?;
         tx.commit()?;
     }
+    if version < 5 {
+        let tx = connection.transaction()?;
+        tx.execute_batch("ALTER TABLE messages ADD COLUMN run_id TEXT REFERENCES runs(id)")?;
+        tx.pragma_update(None, "user_version", 5)?;
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -579,8 +587,8 @@ fn collect_rows<T>(
 
 fn insert_message_row(tx: &Transaction<'_>, message: &Message) -> StorageResult<()> {
     tx.execute(
-        "INSERT INTO messages (id, channel_id, thread_id, author, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![message.id.to_string(), message.channel_id.to_string(), optional_id(message.thread_id), to_json!(&message.author)?, message.body, message.created_at],
+        "INSERT INTO messages (id, channel_id, thread_id, author, body, created_at, run_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![message.id.to_string(), message.channel_id.to_string(), optional_id(message.thread_id), to_json!(&message.author)?, message.body, message.created_at, optional_id(message.run_id)],
     )?;
     Ok(())
 }
@@ -664,7 +672,7 @@ query_entities!(
 query_entities!(
     query_messages,
     Message,
-    "SELECT m.id, m.channel_id, m.thread_id, m.author, m.body, m.created_at FROM messages m JOIN channels c ON c.id = m.channel_id WHERE c.workspace_id = ?1 ORDER BY m.created_at, m.id",
+    "SELECT m.id, m.channel_id, m.thread_id, m.author, m.body, m.created_at, m.run_id FROM messages m JOIN channels c ON c.id = m.channel_id WHERE c.workspace_id = ?1 ORDER BY m.created_at, m.id",
     |row| -> rusqlite::Result<StorageResult<Message>> {
         Ok(Ok(Message {
             id: parse_id(&row.get::<_, String>(0)?)?,
@@ -676,6 +684,10 @@ query_entities!(
             author: from_json!(&row.get::<_, String>(3)?)?,
             body: row.get(4)?,
             created_at: row.get(5)?,
+            run_id: row
+                .get::<_, Option<String>>(6)?
+                .map(|id| parse_id(&id))
+                .transpose()?,
         }))
     }
 );

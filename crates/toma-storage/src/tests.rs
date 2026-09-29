@@ -53,6 +53,7 @@ impl Fixture {
             author: MessageAuthor::Person(person.id),
             body: "Implement persistence".into(),
             created_at: 110,
+            run_id: None,
         };
         let attachment = Attachment {
             id: AttachmentId::new(),
@@ -179,6 +180,26 @@ fn round_trips_every_snapshot_entity_across_restart() {
             created_at: 170,
         }]
     );
+}
+
+#[test]
+fn agent_reply_keeps_the_run_that_produced_it() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let fixture = Fixture::new(Path::new("/repo"));
+    fixture.persist(&store);
+    let reply = Message {
+        id: MessageId::new(),
+        channel_id: fixture.channel.id,
+        thread_id: Some(fixture.thread.id),
+        author: MessageAuthor::Agent(fixture.agent.id),
+        body: "Done".into(),
+        created_at: 180,
+        run_id: Some(fixture.run.id),
+    };
+    store.insert_message(&reply, &[]).unwrap();
+
+    let snapshot = store.snapshot(fixture.workspace.id).unwrap();
+    assert_eq!(snapshot.messages, vec![fixture.root_message, reply]);
 }
 
 #[test]

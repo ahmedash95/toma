@@ -32,6 +32,9 @@ const THREAD_WIDTH: (f32, f32) = (300., 900.);
 const SIDEBAR_WIDTH: f32 = 240.;
 const CONVERSATION_MIN: f32 = 360.;
 const INSPECTOR_MIN: f32 = 320.;
+const RUN_DETAILS_WIDTH: f32 = 400.;
+/// Characters of a tool's input or output shown when expanded; the rest is summarized.
+const STEP_TEXT_LIMIT: usize = 20_000;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Divider {
@@ -61,6 +64,7 @@ pub struct TomaShell {
     /// Requests that already took focus once, so they don't grab it again.
     focused_requests: HashSet<String>,
     palette: Option<Palette>,
+    run_details: Option<RunDetails>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -73,6 +77,18 @@ struct Palette {
     /// Where focus goes back to when the palette closes without jumping.
     return_focus: Option<FocusHandle>,
     _subscription: Subscription,
+}
+
+/// The run whose details pane is open.
+struct RunDetails {
+    run_id: RunId,
+    /// `None` until the first load finishes.
+    steps: Option<Result<Vec<TranscriptEntry>, String>>,
+    /// Tool steps the person expanded, by index; steps are only ever appended.
+    expanded: HashSet<usize>,
+    loading: bool,
+    /// The snapshot changed during a load, so the steps may already be behind.
+    stale: bool,
 }
 
 impl TomaShell {
@@ -155,6 +171,7 @@ impl TomaShell {
                         };
                         let updated = this.update(cx, |shell, cx| {
                             shell.model.replace_snapshot(snapshot);
+                            shell.refresh_run_details(cx);
                             cx.notify();
                         });
                         if updated.is_err() {
@@ -181,6 +198,7 @@ impl TomaShell {
                 request_buttons: HashMap::new(),
                 focused_requests: HashSet::new(),
                 palette: None,
+                run_details: None,
                 _subscriptions: subscriptions,
             }
         })
@@ -279,6 +297,83 @@ impl TomaShell {
             request_id: request.id.clone(),
             decision,
         });
+    }
+
+    /// Opens the details of `run_id`, or closes them when they are already showing.
+    fn toggle_run_details(&mut self, run_id: RunId, cx: &mut Context<Self>) {
+        if self
+            .run_details
+            .as_ref()
+            .is_some_and(|d| d.run_id == run_id)
+        {
+            self.run_details = None;
+        } else {
+            self.run_details = Some(RunDetails {
+                run_id,
+                steps: None,
+                expanded: HashSet::new(),
+                loading: false,
+                stale: false,
+            });
+            self.load_run_details(cx);
+        }
+        cx.notify();
+    }
+
+    /// Keeps the open details current while their run is still producing output.
+    fn refresh_run_details(&mut self, cx: &mut Context<Self>) {
+        let Some(details) = &mut self.run_details else {
+            return;
+        };
+        if details.loading {
+            details.stale = true;
+        } else if details.steps.is_none()
+            || self
+                .model
+                .run(details.run_id)
+                .is_some_and(|run| !run.status.is_terminal())
+            || details.stale
+        {
+            self.load_run_details(cx);
+        }
+    }
+
+    fn load_run_details(&mut self, cx: &mut Context<Self>) {
+        let (Some((core, _)), Some(details)) = (self.backend.clone(), &mut self.run_details) else {
+            return;
+        };
+        let run_id = details.run_id;
+        details.loading = true;
+        details.stale = false;
+        let steps = cx
+            .background_executor()
+            .spawn(async move { core.run_transcript(run_id) });
+        cx.spawn(async move |this: gpui::WeakEntity<Self>, cx| {
+            let steps = steps.await.map_err(|error| error.to_string());
+            this.update(cx, |shell, cx| {
+                let Some(details) = shell.run_details.as_mut().filter(|d| d.run_id == run_id)
+                else {
+                    return;
+                };
+                details.steps = Some(steps);
+                details.loading = false;
+                if details.stale {
+                    shell.refresh_run_details(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn toggle_step(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(details) = &mut self.run_details
+            && !details.expanded.remove(&index)
+        {
+            details.expanded.insert(index);
+        }
+        cx.notify();
     }
 
     fn new_channel(&mut self, cx: &mut Context<Self>) {
@@ -1321,6 +1416,7 @@ impl TomaShell {
         });
 
         div()
+            .group(MESSAGE_GROUP)
             .flex()
             .gap_3()
             .py_2()
@@ -1333,7 +1429,14 @@ impl TomaShell {
                 div()
                     .min_w(px(0.))
                     .flex_grow()
-                    .child(message_header(&author, message.created_at, theme))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(message_header(&author, message.created_at, theme))
+                            .children(self.run_details_button(&message, theme, cx)),
+                    )
                     .child(render_markdown(
                         SharedString::from(format!("m-{}", message.id)),
                         &message.body,
@@ -1463,11 +1566,9 @@ impl TomaShell {
                         .track_scroll(&self.thread_scroll)
                         .px_4()
                         .py_3()
-                        .children(
-                            root.map(|message| {
-                                self.thread_message(message, on_link.clone(), theme)
-                            }),
-                        )
+                        .children(root.map(|message| {
+                            self.thread_message(message, on_link.clone(), theme, cx)
+                        }))
                         .child(
                             div()
                                 .my_2()
@@ -1482,11 +1583,9 @@ impl TomaShell {
                                 })
                                 .child(div().flex_grow().h(px(1.)).bg(theme.separator)),
                         )
-                        .children(
-                            replies.into_iter().map(|message| {
-                                self.thread_message(message, on_link.clone(), theme)
-                            }),
-                        )
+                        .children(replies.into_iter().map(|message| {
+                            self.thread_message(message, on_link.clone(), theme, cx)
+                        }))
                         .children(cards)
                         .children((!working.is_empty()).then(|| {
                             div()
@@ -1705,9 +1804,16 @@ impl TomaShell {
             )
     }
 
-    fn thread_message(&self, message: Message, on_link: OnLink, theme: &Theme) -> impl IntoElement {
+    fn thread_message(
+        &self,
+        message: Message,
+        on_link: OnLink,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let author = self.model.author_name(message.author).to_owned();
         div()
+            .group(MESSAGE_GROUP)
             .flex()
             .gap_2()
             .py_2()
@@ -1720,7 +1826,14 @@ impl TomaShell {
                 div()
                     .min_w(px(0.))
                     .flex_grow()
-                    .child(message_header(&author, message.created_at, theme))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(message_header(&author, message.created_at, theme))
+                            .children(self.run_details_button(&message, theme, cx)),
+                    )
                     .child(render_markdown(
                         SharedString::from(format!("t-{}", message.id)),
                         &message.body,
@@ -1729,6 +1842,345 @@ impl TomaShell {
                         on_link,
                     )),
             )
+            .into_any_element()
+    }
+
+    /// Opens what the agent did to produce `message`; shown on hover for agent replies
+    /// that know their run.
+    fn run_details_button(
+        &self,
+        message: &Message,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let run_id = message.run_id?;
+        if self.backend.is_none() || !matches!(message.author, MessageAuthor::Agent(_)) {
+            return None;
+        }
+        let open = self
+            .run_details
+            .as_ref()
+            .is_some_and(|d| d.run_id == run_id);
+        Some(
+            div()
+                .id(SharedString::from(format!("run-details-{}", message.id)))
+                .size(px(22.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .when(open, |button| button.bg(theme.selection))
+                .when(!open, |button| {
+                    button
+                        .opacity(0.)
+                        .group_hover(MESSAGE_GROUP, |button| button.opacity(1.))
+                })
+                .hover(|button| button.bg(theme.hover))
+                .tooltip(|_window, cx| cx.new(|_| Tooltip("Run details".into())).into())
+                .on_click(cx.listener(move |this, _, _, cx| this.toggle_run_details(run_id, cx)))
+                .child(Icon::RunDetails.view(theme.text_secondary).size(px(14.)))
+                .into_any_element(),
+        )
+    }
+
+    fn run_details_pane(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let details = self.run_details.as_ref()?;
+        let run_id = details.run_id;
+        let run = self.model.run(run_id);
+        let agent = self
+            .model
+            .run_agent(run_id)
+            .map(|agent| {
+                self.model
+                    .author_name(MessageAuthor::Agent(agent))
+                    .to_owned()
+            })
+            .unwrap_or_default();
+        let started = run.and_then(|run| run.started_at);
+        let body: Vec<AnyElement> = match &details.steps {
+            None => vec![pane_note("Loading…", theme)],
+            Some(Err(error)) => vec![pane_note(format!("Couldn't load this run: {error}"), theme)],
+            Some(Ok(steps)) if steps.is_empty() => {
+                vec![pane_note("This run recorded no steps.", theme)]
+            }
+            Some(Ok(steps)) => {
+                let start = started.or(steps.first().map(|step| step.at)).unwrap_or(0);
+                steps
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entry)| {
+                        let expanded = details.expanded.contains(&index);
+                        self.run_step(run_id, index, entry, entry.at - start, expanded, theme, cx)
+                    })
+                    .collect()
+            }
+        };
+
+        Some(
+            div()
+                .w(px(RUN_DETAILS_WIDTH))
+                .h_full()
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .bg(theme.content_bg)
+                .border_l_1()
+                .border_color(theme.separator)
+                .child(
+                    titlebar_drag_area()
+                        .h(px(TITLEBAR))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .pl_4()
+                        .pr_2()
+                        .border_b_1()
+                        .border_color(theme.separator)
+                        .child(
+                            div()
+                                .min_w(px(0.))
+                                .flex_grow()
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .truncate()
+                                        .child(format!("Run details · {agent}")),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_size(px(11.))
+                                        .text_color(theme.text_secondary)
+                                        .children(run.map(|run| {
+                                            div()
+                                                .flex_shrink_0()
+                                                .child(status_badge(run.status, theme))
+                                        }))
+                                        .children(stats_row(self.model.run_stats(run_id), theme)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("close-run-details")
+                                .size(px(24.))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(6.))
+                                .cursor_pointer()
+                                .hover(|button| button.bg(theme.hover))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.run_details = None;
+                                    cx.notify();
+                                }))
+                                .child(Icon::Close.view(theme.text_secondary).size(px(14.))),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("run-steps")
+                        .flex_grow()
+                        .overflow_y_scroll()
+                        .px_4()
+                        .py_3()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .children(body)
+                        .child(
+                            div()
+                                .mt_3()
+                                .text_size(px(11.))
+                                .text_color(theme.text_tertiary)
+                                .child(
+                                    "What the agent's CLI reported: reasoning summaries, tool \
+                                     calls and their output. Hidden reasoning isn't shared by \
+                                     providers, and values that look like credentials are hidden.",
+                                ),
+                        ),
+                ),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_step(
+        &self,
+        run_id: RunId,
+        index: usize,
+        entry: &TranscriptEntry,
+        offset_ms: i64,
+        expanded: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = format!("step-{run_id}-{index}");
+        let heading = |icon: Icon, color: Hsla, label: SharedString| {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .min_w(px(0.))
+                .text_size(px(12.))
+                .child(icon.view(color).size(px(13.)))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.text_secondary)
+                        .child(label),
+                )
+        };
+        let time = div()
+            .flex_shrink_0()
+            .ml_auto()
+            .text_size(px(11.))
+            .text_color(theme.text_tertiary)
+            .child(format!("+{}", format_duration(offset_ms.max(0))));
+        let step = match &entry.step {
+            TranscriptStep::Thinking { text } | TranscriptStep::Text { text } => {
+                let (icon, label) = match entry.step {
+                    TranscriptStep::Thinking { .. } => (Icon::Thinking, "Thinking"),
+                    _ => (Icon::Replies, "Response"),
+                };
+                div()
+                    .py_1()
+                    .child(heading(icon, theme.text_secondary, label.into()).child(time))
+                    .child(div().pl(px(21.)).pt_1().child(render_markdown(
+                        SharedString::from(id),
+                        text,
+                        &self.model.mention_names(),
+                        theme,
+                        self.link_handler(self.model.open_thread_id(), cx),
+                    )))
+                    .into_any_element()
+            }
+            TranscriptStep::Notice { text } | TranscriptStep::Error { text } => {
+                let error = matches!(entry.step, TranscriptStep::Error { .. });
+                let (icon, color) = if error {
+                    (Icon::CircleX, theme.red)
+                } else {
+                    (Icon::Plan, theme.text_secondary)
+                };
+                div()
+                    .py_1()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .text_size(px(12.))
+                    .child(div().mt(px(2.)).child(icon.view(color).size(px(13.))))
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .flex_grow()
+                            .text_color(if error {
+                                theme.red
+                            } else {
+                                theme.text_secondary
+                            })
+                            .child(text.clone()),
+                    )
+                    .child(time)
+                    .into_any_element()
+            }
+            TranscriptStep::ToolCall {
+                name,
+                summary,
+                input,
+            } => self.collapsible_step(
+                id,
+                index,
+                expanded,
+                heading(tool_icon(name), theme.text_secondary, name.clone().into())
+                    .child(step_preview(summary, true, theme))
+                    .child(time),
+                input,
+                theme,
+                cx,
+            ),
+            TranscriptStep::ToolResult { output, is_error } => {
+                let (icon, color, label) = if *is_error {
+                    (Icon::CircleX, theme.red, "Error")
+                } else {
+                    (Icon::CircleCheck, theme.green, "Output")
+                };
+                let preview = output.lines().find(|line| !line.trim().is_empty());
+                self.collapsible_step(
+                    id,
+                    index,
+                    expanded,
+                    heading(icon, color, label.into())
+                        .child(step_preview(preview.unwrap_or("(empty)"), true, theme))
+                        .child(time),
+                    output,
+                    theme,
+                    cx,
+                )
+            }
+        };
+        div()
+            .when(entry.subagent, |step| {
+                step.ml_3()
+                    .pl_2()
+                    .border_l_2()
+                    .border_color(theme.separator)
+            })
+            .child(step)
+            .into_any_element()
+    }
+
+    /// A one-line row that expands to show `detail` as selectable, copyable code.
+    #[allow(clippy::too_many_arguments)]
+    fn collapsible_step(
+        &self,
+        id: String,
+        index: usize,
+        expanded: bool,
+        header: gpui::Div,
+        detail: &str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let chevron = if expanded {
+            Icon::ChevronDown
+        } else {
+            Icon::ChevronRight
+        };
+        div()
+            .child(
+                div()
+                    .id(SharedString::from(format!("{id}-toggle")))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .py(px(3.))
+                    .px_1()
+                    .ml(px(-4.))
+                    .rounded(px(5.))
+                    .cursor_pointer()
+                    .hover(|row| row.bg(theme.hover))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_step(index, cx)))
+                    .child(chevron.view(theme.text_tertiary).size(px(12.)))
+                    .child(header.flex_grow()),
+            )
+            .children((expanded && !detail.is_empty()).then(|| {
+                div().pl(px(17.)).pt_1().pb_1().child(render_markdown(
+                    SharedString::from(id),
+                    &code_fence(detail),
+                    &[],
+                    theme,
+                    self.link_handler(self.model.open_thread_id(), cx),
+                ))
+            }))
+            .into_any_element()
     }
 }
 
@@ -1748,12 +2200,18 @@ impl Render for TomaShell {
             window.focus(&focus);
         }
         let active = self.model.open_thread_id();
-        // Native web views draw above GPUI, so they would cover the palette.
-        let palette_open = self.palette.is_some();
+        // Native web views draw above GPUI, so they would cover the palette or run details.
+        let covered = self.palette.is_some() || self.run_details.is_some();
         for (thread, inspector) in &mut self.inspectors {
-            inspector.sync_visibility(Some(*thread) == active && !palette_open);
+            inspector.sync_visibility(Some(*thread) == active && !covered);
         }
-        let inspector = self.inspector(window, &theme, cx);
+        // Run details and the browser inspector share the right-side slot. Keep the
+        // inspector's tabs alive while details are open, then reveal them again on close.
+        let inspector = self
+            .run_details
+            .is_none()
+            .then(|| self.inspector(window, &theme, cx))
+            .flatten();
         focus_navigation(div())
             .size_full()
             .flex()
@@ -1777,12 +2235,17 @@ impl Render for TomaShell {
                     / crate::zoom::zoom();
                 match divider {
                     Divider::Thread => {
-                        let inspector = match this.open_inspector() {
-                            Some(_) => this.inspector_room(window),
-                            None => 0.,
+                        let inspector = match (this.run_details.is_none(), this.open_inspector()) {
+                            (true, Some(_)) => this.inspector_room(window),
+                            _ => 0.,
                         };
-                        this.thread_width =
-                            (from_right - inspector).clamp(THREAD_WIDTH.0, THREAD_WIDTH.1);
+                        let run_details = if this.run_details.is_some() {
+                            RUN_DETAILS_WIDTH
+                        } else {
+                            0.
+                        };
+                        this.thread_width = (from_right - inspector - run_details)
+                            .clamp(THREAD_WIDTH.0, THREAD_WIDTH.1);
                     }
                     Divider::Inspector => this.inspector_width = from_right.max(INSPECTOR_MIN),
                 }
@@ -1802,6 +2265,7 @@ impl Render for TomaShell {
             .child(self.conversation(&theme, cx))
             .children(self.thread_pane(&theme, cx))
             .children(inspector)
+            .children(self.run_details_pane(&theme, cx))
             .children(self.palette_overlay(&theme, cx))
     }
 }
@@ -1819,6 +2283,55 @@ fn icon_button(id: &'static str, icon: Icon, theme: &Theme) -> gpui::Stateful<gp
         .cursor_pointer()
         .hover(|button| button.bg(theme.hover))
         .child(icon.view(theme.text_secondary).size(px(14.)))
+}
+
+/// Groups a message row so its hover-only controls appear with it.
+const MESSAGE_GROUP: &str = "message";
+
+fn tool_icon(name: &str) -> Icon {
+    match name {
+        "Bash" | "Shell" => Icon::Terminal,
+        "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => Icon::FileEdit,
+        _ => Icon::Tool,
+    }
+}
+
+/// The rest of a collapsed step's line, clipped at the pane edge.
+fn step_preview(text: &str, monospace: bool, theme: &Theme) -> impl IntoElement {
+    div()
+        .min_w(px(0.))
+        .flex_shrink()
+        .truncate()
+        .text_color(theme.text_tertiary)
+        .when(monospace, |preview| {
+            preview.font_family("Menlo").text_size(px(11.))
+        })
+        .child(text.lines().next().unwrap_or_default().to_owned())
+}
+
+fn pane_note(text: impl Into<SharedString>, theme: &Theme) -> AnyElement {
+    div()
+        .py_2()
+        .text_size(px(12.))
+        .text_color(theme.text_secondary)
+        .child(text.into())
+        .into_any_element()
+}
+
+/// `text` as a Markdown code block, fenced so nothing inside can close it, and cut to
+/// `STEP_TEXT_LIMIT` characters.
+fn code_fence(text: &str) -> String {
+    let (shown, hidden) = match text.char_indices().nth(STEP_TEXT_LIMIT) {
+        Some((cut, _)) => (&text[..cut], text[cut..].chars().count()),
+        None => (text, 0),
+    };
+    let longest_run = shown.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest_run.max(2) + 1);
+    let mut block = format!("{fence}\n{shown}\n{fence}");
+    if hidden > 0 {
+        block.push_str(&format!("\n\n*{hidden} more characters not shown*"));
+    }
+    block
 }
 
 /// Empty space in the title bar strip: drags the window, double-click zooms, like AppKit.
@@ -2052,6 +2565,14 @@ impl Render for Tooltip {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_fence_outlasts_backticks_inside_and_caps_length() {
+        assert_eq!(code_fence("a ``` b"), "````\na ``` b\n````");
+        assert_eq!(code_fence("plain"), "```\nplain\n```");
+        let long = "x".repeat(STEP_TEXT_LIMIT + 5);
+        assert!(code_fence(&long).ends_with("*5 more characters not shown*"));
+    }
 
     #[test]
     fn stats_are_formatted_compactly() {
