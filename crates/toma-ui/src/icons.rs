@@ -32,6 +32,7 @@ icons! {
     CircleCheck => "lucide/circle-check.svg",
     CircleX => "lucide/circle-x.svg",
     Plan => "lucide/clipboard-list.svg",
+    Sidebar => "lucide/panel-left.svg",
     Claude => "logos/claude.svg",
     Cursor => "logos/cursor.svg",
     OpenAi => "logos/openai.svg",

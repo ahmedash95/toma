@@ -49,6 +49,8 @@ pub fn init(cx: &mut App) {
         Menu {
             name: "View".into(),
             items: vec![
+                MenuItem::action("Toggle Sidebar", crate::shell::ToggleSidebar),
+                MenuItem::separator(),
                 MenuItem::action("Actual Size", ResetZoom),
                 MenuItem::action("Zoom In", ZoomIn),
                 MenuItem::action("Zoom Out", ZoomOut),
@@ -73,8 +75,17 @@ fn clamp(value: f32) -> f32 {
 }
 
 fn saved_path() -> Option<PathBuf> {
+    support_path("zoom")
+}
+
+/// Where UI preferences that outlive a launch are kept.
+pub(crate) fn support_path(name: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/Toma/zoom"))
+    Some(
+        PathBuf::from(home)
+            .join("Library/Application Support/Toma")
+            .join(name),
+    )
 }
 
 #[cfg(test)]
