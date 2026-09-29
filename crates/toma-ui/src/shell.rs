@@ -23,6 +23,7 @@ use crate::controls::{ButtonStyle, Cancel, OnPress, button, focus_navigation};
 use crate::icons::Icon;
 use crate::inspector::{Inspector, Tab, TabContent, TabId, ToggleInspector};
 use crate::markdown::{OnLink, render_markdown};
+use crate::palette::{self, Jump, PaletteItem, TogglePalette};
 use crate::view_model::{ContextKey, ShellViewModel, ThreadStats};
 
 /// Height of the unified title bar strip; the traffic lights sit inside it.
@@ -59,7 +60,19 @@ pub struct TomaShell {
     request_buttons: HashMap<String, [FocusHandle; 4]>,
     /// Requests that already took focus once, so they don't grab it again.
     focused_requests: HashSet<String>,
+    palette: Option<Palette>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// The open ⌘K jump palette.
+struct Palette {
+    input: Entity<Composer>,
+    query: String,
+    selected: usize,
+    scroll: ScrollHandle,
+    /// Where focus goes back to when the palette closes without jumping.
+    return_focus: Option<FocusHandle>,
+    _subscription: Subscription,
 }
 
 impl TomaShell {
@@ -167,6 +180,7 @@ impl TomaShell {
                 pending_focus: None,
                 request_buttons: HashMap::new(),
                 focused_requests: HashSet::new(),
+                palette: None,
                 _subscriptions: subscriptions,
             }
         })
@@ -202,6 +216,7 @@ impl TomaShell {
                 self.save_draft(key, body);
             }
             ComposerEvent::Submitted(body) => self.submit(key, body),
+            ComposerEvent::Navigate(_) | ComposerEvent::Cancelled => {}
         }
         cx.notify();
     }
@@ -421,6 +436,26 @@ impl TomaShell {
         cx.notify();
     }
 
+    fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() {
+            return self.close_palette(true, cx);
+        }
+        let input = cx.new(|cx| Composer::search("Jump to a channel or thread", cx));
+        let subscription = cx.subscribe(&input, |shell: &mut Self, _, event, cx| {
+            shell.palette_event(event, cx)
+        });
+        self.pending_focus = Some(input.focus_handle(cx));
+        self.palette = Some(Palette {
+            input,
+            query: String::new(),
+            selected: 0,
+            scroll: ScrollHandle::new(),
+            return_focus: window.focused(cx),
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
     fn browser_mut(&mut self, tab: TabId) -> Option<&mut Browser> {
         self.inspectors
             .values_mut()
@@ -488,6 +523,49 @@ impl TomaShell {
                 }
                 _ => cx.open_url(&url),
             },
+        }
+        cx.notify();
+    }
+
+    fn close_palette(&mut self, restore_focus: bool, cx: &mut Context<Self>) {
+        if let Some(palette) = self.palette.take()
+            && restore_focus
+        {
+            self.pending_focus = palette.return_focus;
+        }
+        cx.notify();
+    }
+
+    fn palette_items(&self) -> Vec<PaletteItem> {
+        self.palette
+            .as_ref()
+            .map_or_else(Vec::new, |p| palette::search(&self.model, &p.query))
+    }
+
+    fn palette_event(&mut self, event: &ComposerEvent, cx: &mut Context<Self>) {
+        let count = self.palette_items().len();
+        let Some(palette) = self.palette.as_mut() else {
+            return;
+        };
+        match event {
+            ComposerEvent::Changed(query) => {
+                palette.query = query.clone();
+                palette.selected = 0;
+                palette.scroll.scroll_to_item(0);
+            }
+            ComposerEvent::Navigate(delta) if count > 0 => {
+                palette.selected =
+                    (palette.selected as isize + delta).rem_euclid(count as isize) as usize;
+                palette.scroll.scroll_to_item(palette.selected);
+            }
+            ComposerEvent::Navigate(_) => {}
+            ComposerEvent::Submitted(_) => {
+                let selected = palette.selected;
+                if let Some(item) = self.palette_items().get(selected) {
+                    return self.jump(item.jump, cx);
+                }
+            }
+            ComposerEvent::Cancelled => return self.close_palette(true, cx),
         }
         cx.notify();
     }
@@ -723,6 +801,120 @@ impl TomaShell {
             )
     }
 
+    fn jump(&mut self, jump: Jump, cx: &mut Context<Self>) {
+        self.close_palette(false, cx);
+        match jump {
+            Jump::Channel(id) => self.select_channel(id, cx),
+            Jump::Thread(id) => self.open_thread(id, cx),
+        }
+    }
+
+    fn palette_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let palette = self.palette.as_ref()?;
+        let items = self.palette_items();
+        let selected = palette.selected.min(items.len().saturating_sub(1));
+        let rows: Vec<_> = items
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let jump = item.jump;
+                let icon = match (item.status, item.folder) {
+                    (Some(status), _) => status_dot(status, theme).into_any_element(),
+                    (None, true) => Icon::Folder
+                        .view(theme.text_secondary)
+                        .size(px(14.))
+                        .into_any_element(),
+                    (None, false) => Icon::Hash
+                        .view(theme.text_secondary)
+                        .size(px(14.))
+                        .into_any_element(),
+                };
+                sidebar_row(("palette-item", index), index == selected, theme)
+                    .flex_shrink_0()
+                    .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+                        if let Some(palette) = this.palette.as_mut()
+                            && palette.selected != index
+                        {
+                            palette.selected = index;
+                            cx.notify();
+                        }
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| this.jump(jump, cx)))
+                    .child(div().w(px(14.)).flex().justify_center().child(icon))
+                    .child(div().flex_grow().min_w(px(0.)).truncate().child(item.title))
+                    .children((!item.subtitle.is_empty()).then(|| {
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(11.))
+                            .text_color(theme.text_secondary)
+                            .child(format!("#{}", item.subtitle))
+                    }))
+            })
+            .collect();
+        let empty = rows.is_empty();
+
+        Some(
+            div()
+                .id("palette-scrim")
+                .absolute()
+                .inset_0()
+                .occlude()
+                .flex()
+                .justify_center()
+                .items_start()
+                .pt(px(TITLEBAR + 40.))
+                .bg(gpui::black().opacity(if theme.dark { 0.3 } else { 0.12 }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.close_palette(true, cx)),
+                )
+                .child(
+                    div()
+                        .id("palette")
+                        .w(px(560.))
+                        .max_h(px(440.))
+                        .flex()
+                        .flex_col()
+                        .p_2()
+                        .rounded(px(10.))
+                        .border_1()
+                        .border_color(theme.separator)
+                        .bg(theme.control_bg)
+                        .shadow_lg()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(palette.input.clone())
+                        .child(
+                            div()
+                                .id("palette-results")
+                                .mt_2()
+                                .flex_grow()
+                                .min_h(px(0.))
+                                .flex()
+                                .flex_col()
+                                .overflow_y_scroll()
+                                .track_scroll(&palette.scroll)
+                                .children(empty.then(|| {
+                                    div()
+                                        .px_2()
+                                        .py_1()
+                                        .text_size(px(12.))
+                                        .text_color(theme.text_tertiary)
+                                        .child("No channels or threads match")
+                                }))
+                                .children(rows),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .px_2()
+                                .text_size(px(11.))
+                                .text_color(theme.text_tertiary)
+                                .child("↑↓ navigate · ⏎ open · esc close"),
+                        ),
+                ),
+        )
+    }
+
     /// A round badge: the provider's logo for agents, an initial for people.
     fn avatar(&self, author: MessageAuthor, size: f32, theme: &Theme) -> AnyElement {
         let provider = match author {
@@ -780,7 +972,7 @@ impl TomaShell {
     }
 
     /// Gives each visible permission request its buttons, and focuses Allow the first time
-    /// the request is shown, unless the person is in the middle of typing a reply.
+    /// the request is shown, unless the person is typing a reply or using the jump palette.
     fn prepare_request_focus(&mut self, window: &Window, cx: &mut Context<Self>) {
         let live: HashSet<String> = self
             .model
@@ -811,7 +1003,7 @@ impl TomaShell {
                 [1, 2, 3, 4].map(|index| cx.focus_handle().tab_stop(true).tab_index(index))
             })[1]
                 .clone();
-            if !typing && self.focused_requests.insert(id) {
+            if !typing && self.palette.is_none() && self.focused_requests.insert(id) {
                 self.pending_focus = Some(allow);
             }
         }
@@ -858,6 +1050,27 @@ impl TomaShell {
                     .overflow_y_scroll()
                     .px_2()
                     .pb_3()
+                    .child(
+                        div()
+                            .id("jump-to")
+                            .mb_2()
+                            .h(px(26.))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .px_2()
+                            .rounded(px(6.))
+                            .bg(theme.selection)
+                            .text_size(px(12.))
+                            .text_color(theme.text_secondary)
+                            .cursor_pointer()
+                            .hover(|row| row.opacity(0.85))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.toggle_palette(window, cx)),
+                            )
+                            .child("Jump to…")
+                            .child(div().text_color(theme.text_tertiary).child("⌘K")),
+                    )
                     .child(
                         section_header("Channels", theme).child(
                             div()
@@ -1535,8 +1748,10 @@ impl Render for TomaShell {
             window.focus(&focus);
         }
         let active = self.model.open_thread_id();
+        // Native web views draw above GPUI, so they would cover the palette.
+        let palette_open = self.palette.is_some();
         for (thread, inspector) in &mut self.inspectors {
-            inspector.sync_visibility(Some(*thread) == active);
+            inspector.sync_visibility(Some(*thread) == active && !palette_open);
         }
         let inspector = self.inspector(window, &theme, cx);
         focus_navigation(div())
@@ -1549,6 +1764,9 @@ impl Render for TomaShell {
                 this.toggle_inspector(window, cx)
             }))
             .when(self.resizing.is_some(), |root| root.cursor_col_resize())
+            .on_action(
+                cx.listener(|this, _: &TogglePalette, window, cx| this.toggle_palette(window, cx)),
+            )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 let Some(divider) = this.resizing else {
                     return;
@@ -1584,6 +1802,7 @@ impl Render for TomaShell {
             .child(self.conversation(&theme, cx))
             .children(self.thread_pane(&theme, cx))
             .children(inspector)
+            .children(self.palette_overlay(&theme, cx))
     }
 }
 
